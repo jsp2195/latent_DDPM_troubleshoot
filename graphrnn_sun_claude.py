@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
-import matplotlib.pyplot as plt
 import matplotlib
-#matplotlib.use('Agg')  # Switch to a non-GUI backend (suitable for saving figures)
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.optim.lr_scheduler import OneCycleLR
@@ -354,7 +354,7 @@ def generate_and_save(epoch, sample_graph, node_rnn, edge_rnn, hidden_projection
     max_nodes = sample_graph.number_of_nodes()
 
     # Iteratively add nodes until the graph reaches the desired size
-    current_graph = new_graph.copy()  # Start with the reduced graph (just the first node)
+    current_graph = new_graph.copy()  # Start with the Graph From Data
     
     while current_graph.number_of_nodes() < max_nodes:
         # Generate the next node and edges based on the current state of the graph
@@ -363,10 +363,10 @@ def generate_and_save(epoch, sample_graph, node_rnn, edge_rnn, hidden_projection
         )
         current_graph = add_node_to_graph(current_graph, new_node_features, new_edges)
 
-    # Plot the reduced graph (with just the first node)
+    # Plot the rGraph From Data
     fig = plt.figure(figsize=(15, 7))
     ax1 = fig.add_subplot(121, projection='3d')
-    plot_graph_3d(norm_graph, ax1, 'Reduced Graph (First Node Only)')
+    plot_graph_3d(norm_graph, ax1, 'Graph From Data')
 
     # Plot the updated graph (with all nodes added back)
     ax2 = fig.add_subplot(122, projection='3d')
@@ -562,7 +562,7 @@ adj_matrices_val, positions_list_val, scales_list_val, obb_euler_list_val, curva
 print(f"Full train samples: {len(adj_matrices)}")
 print(f"Full val samples: {len(adj_matrices_val)}")
 
-subsample = False
+subsample = True
 MAX_TRAIN_SAMPLES = 2000
 MAX_VAL_SAMPLES = 500
 

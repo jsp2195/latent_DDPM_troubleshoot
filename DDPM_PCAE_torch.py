@@ -29,9 +29,7 @@ python3 DDPM_PCAE_torch.py train_ae \
   --patience 30 \
   --ae_lr 1e-4 \
   --max_train_samples 1000 \
-  --max_val_samples 1000 \
-  --seed 42 \
-  --verbose
+  --max_val_samples 1000 
 
 # If max_train_samples / max_val_samples are omitted, val_split is used.
 python3 DDPM_PCAE_torch.py train_ae \
@@ -42,17 +40,13 @@ python3 DDPM_PCAE_torch.py train_ae \
   --ae_epochs 300 \
   --patience 30 \
   --ae_lr 1e-4 \
-  --val_split 0.1 \
-  --seed 42 \
-  --verbose
-
+  --val_split 0.1 
+  
 python3 DDPM_PCAE_torch.py encode_dataset \
   --pointcloud_path data/normalized_rotated_point_clouds6.npy \
   --ae_ckpt_dir checkpoints/ae \
   --encoded_features encoded_features.npy \
-  --encode_batch_size 64 \
-  --seed 42 \
-  --verbose
+  --encode_batch_size 64 
 
 python3 DDPM_PCAE_torch.py train_ddpm \
   --encoded_features encoded_features.npy \
@@ -68,9 +62,7 @@ python3 DDPM_PCAE_torch.py train_ddpm \
   --max_val_samples 1000 \
   --timesteps 1000 \
   --beta_start 1e-4 \
-  --beta_end 0.025 \
-  --seed 42 \
-  --verbose
+  --beta_end 0.025 
 
 # If max_train_samples / max_val_samples are omitted, val_split is used.
 python3 DDPM_PCAE_torch.py train_ddpm \
@@ -86,9 +78,7 @@ python3 DDPM_PCAE_torch.py train_ddpm \
   --val_split 0.2 \
   --timesteps 1000 \
   --beta_start 1e-4 \
-  --beta_end 0.025 \
-  --seed 42 \
-  --verbose
+  --beta_end 0.025 
 '''
 # -----------------------------
 # Config / constants
@@ -106,6 +96,7 @@ DEFAULT_LATENT_NODE_DIR = "outputs/generated_latents"
 DEFAULT_LATENT_GRAPH_DIR = "outputs/generated_graph_npz"
 DEFAULT_DECODED_DIR = "outputs/decoded_pointclouds"
 DEFAULT_ASSEMBLY_DIR = "outputs/assemblies"
+DEFAULT_SAMPLE_PLOT_DIR = "outputs/sample_plots"
 
 TIMESTEPS = 1000
 BETA_START = 1e-4
@@ -147,7 +138,11 @@ def load_json(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
+def append_epoch_loss_txt(path: str, epoch: int, train_loss: float, val_loss: float) -> None:
+    ensure_dir(str(Path(path).parent))
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{epoch}\t{train_loss:.8f}\t{val_loss:.8f}\n")
+        
 # -----------------------------
 # DDPM dataset preprocessing
 # -----------------------------
@@ -467,7 +462,11 @@ class UnetConditional(tnn.Module):
         self.curvature_embedding = tnn.Linear(curvature_length, class_emb_dim_curvature)
         self.scale_embedding = tnn.Linear(scale_length, class_emb_dim_scale)
 
-        block_klass = lambda din, dout, tdim: ResnetBlock(din, dout, time_emb_dim=tdim, groups=resnet_block_groups)
+        cond_dim = time_dim + class_emb_dim_obb + class_emb_dim_curvature + class_emb_dim_scale
+
+        block_klass = lambda din, dout, cdim: ResnetBlock(
+            din, dout, time_emb_dim=cdim, groups=resnet_block_groups
+        )
 
         self.downs = tnn.ModuleList()
         self.ups = tnn.ModuleList()
@@ -476,31 +475,34 @@ class UnetConditional(tnn.Module):
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind == (num_resolutions - 1)
             self.downs.append(tnn.ModuleList([
-                block_klass(dim_in, dim_out, time_dim),
-                block_klass(dim_out, dim_out, time_dim),
-                block_klass(dim_out, dim_out, time_dim),
+                block_klass(dim_in, dim_out, cond_dim),
+                block_klass(dim_out, dim_out, cond_dim),
+                block_klass(dim_out, dim_out, cond_dim),
                 Residual(PreNorm(dim_out, LinearAttention(dim_out))),
                 Downsample(dim_out) if not is_last else Identity(),
             ]))
 
         mid_dim = dims[-1]
-        self.mid_block1 = block_klass(mid_dim, mid_dim, time_dim)
+        self.mid_block1 = block_klass(mid_dim, mid_dim, cond_dim)
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
-        self.mid_block2 = block_klass(mid_dim, mid_dim, time_dim)
+        self.mid_block2 = block_klass(mid_dim, mid_dim, cond_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
             is_last = ind == (num_resolutions - 1)
             self.ups.append(tnn.ModuleList([
-                block_klass(dim_out * 2, dim_in, time_dim),
-                block_klass(dim_in, dim_in, time_dim),
-                block_klass(dim_in, dim_in, time_dim),
+                block_klass(dim_out * 2, dim_in, cond_dim),
+                block_klass(dim_in, dim_in, cond_dim),
+                block_klass(dim_in, dim_in, cond_dim),
                 Residual(PreNorm(dim_in, LinearAttention(dim_in))),
                 Upsample(dim_in) if not is_last else Identity(),
             ]))
 
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, lambda: default_out_dim)
-        self.final_conv = tnn.Sequential(block_klass(dim * 2, dim, time_dim), tnn.Conv2d(dim, self.out_dim, kernel_size=1, stride=1))
+        self.final_conv = tnn.Sequential(
+            block_klass(dim, dim, cond_dim),
+            tnn.Conv2d(dim, self.out_dim, kernel_size=1, stride=1),
+        )
 
     def forward(self, x, time=None, class_value=None):
         x = self.init_conv(x)
@@ -729,7 +731,17 @@ def train_ddpm(args) -> None:
     lr_sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.9)
 
     latest_path = os.path.join(args.ddpm_ckpt_dir, "ddpm_latest.pt")
+    loss_txt_path = os.path.join(args.ddpm_ckpt_dir, "ddpm_epoch_losses.txt")
     start_epoch = 1
+    resumed = os.path.exists(latest_path)
+
+    if not resumed:
+        with open(loss_txt_path, "w", encoding="utf-8") as f:
+            f.write("epoch\ttrain_loss\tval_loss\n")
+    elif not os.path.exists(loss_txt_path):
+        with open(loss_txt_path, "w", encoding="utf-8") as f:
+            f.write("epoch\ttrain_loss\tval_loss\n")
+
     if os.path.exists(latest_path):
         state = torch.load(latest_path, map_location=device)
         model.load_state_dict(state["model"])
@@ -758,7 +770,7 @@ def train_ddpm(args) -> None:
         tr = float(np.mean(tr_losses)) if tr_losses else float("inf")
         va = float(np.mean(va_losses)) if va_losses else float("inf")
         logging.info("DDPM epoch %d/%d | train=%.6f val=%.6f", epoch, args.epochs, tr, va)
-
+        append_epoch_loss_txt(loss_txt_path, epoch, tr, va)
         if va < best_val:
             best_val = va
             no_improve = 0
@@ -1066,6 +1078,16 @@ def train_ae(args) -> None:
     start_epoch = 1
     best_val = float("inf")
     latest_path = os.path.join(args.ae_ckpt_dir, "ae_latest.pth")
+    loss_txt_path = os.path.join(args.ae_ckpt_dir, "ae_epoch_losses.txt")
+    resumed = os.path.exists(latest_path)
+
+    if not resumed:
+        with open(loss_txt_path, "w", encoding="utf-8") as f:
+            f.write("epoch\ttrain_loss\tval_loss\n")
+    elif not os.path.exists(loss_txt_path):
+        with open(loss_txt_path, "w", encoding="utf-8") as f:
+            f.write("epoch\ttrain_loss\tval_loss\n")
+
     if os.path.exists(latest_path):
         state = torch.load(latest_path, map_location=device)
         model.load_state_dict(state["model"])
@@ -1079,6 +1101,7 @@ def train_ae(args) -> None:
         tr = train_epoch_ae(model, train_loader, optimizer, device)
         va = validate_epoch_ae(model, val_loader, device)
         logging.info("AE epoch %d/%d | train=%.6f val=%.6f", epoch, args.ae_epochs, tr, va)
+        append_epoch_loss_txt(loss_txt_path, epoch, tr, va)
         if fixed_val_batch is not None:
             save_ae_epoch_visual(
                 model,
@@ -1332,7 +1355,69 @@ def save_ply_if_available(points: np.ndarray, path: Path) -> bool:
     o3d.io.write_point_cloud(str(path), pc)
     return True
 
+def obb_corners_world(obb_euler: np.ndarray, translation: np.ndarray) -> np.ndarray:
+    obb_euler = np.asarray(obb_euler, dtype=np.float32).reshape(-1)
+    translation = np.asarray(translation, dtype=np.float32).reshape(3)
 
+    rot = euler_xyz_to_matrix(
+        float(obb_euler[0]), float(obb_euler[1]), float(obb_euler[2])
+    ) if len(obb_euler) >= 3 else np.eye(3, dtype=np.float32)
+
+    if len(obb_euler) >= 6:
+        extent = np.asarray(obb_euler[3:6], dtype=np.float32)
+    else:
+        extent = np.ones(3, dtype=np.float32)
+
+    half = extent / 2.0
+    local = np.array([
+        [-half[0], -half[1], -half[2]],
+        [-half[0], -half[1],  half[2]],
+        [-half[0],  half[1], -half[2]],
+        [-half[0],  half[1],  half[2]],
+        [ half[0], -half[1], -half[2]],
+        [ half[0], -half[1],  half[2]],
+        [ half[0],  half[1], -half[2]],
+        [ half[0],  half[1],  half[2]],
+    ], dtype=np.float32)
+
+    return local @ rot.T + translation[None, :]
+
+
+def plot_obb_wireframe(ax, obb_euler: np.ndarray, translation: np.ndarray, color: str = "r") -> None:
+    corners = obb_corners_world(obb_euler, translation)
+    edges = [
+        (0, 1), (0, 2), (0, 4),
+        (1, 3), (1, 5),
+        (2, 3), (2, 6),
+        (3, 7),
+        (4, 5), (4, 6),
+        (5, 7),
+        (6, 7),
+    ]
+    for i, j in edges:
+        ax.plot3D(
+            [corners[i, 0], corners[j, 0]],
+            [corners[i, 1], corners[j, 1]],
+            [corners[i, 2], corners[j, 2]],
+            color=color,
+            linewidth=1.0,
+        )
+
+
+def set_axes_equal_3d(ax, pts: np.ndarray) -> None:
+    pts = np.asarray(pts, dtype=np.float32)
+    if pts.size == 0:
+        return
+    mins = pts.min(axis=0)
+    maxs = pts.max(axis=0)
+    center = 0.5 * (mins + maxs)
+    radius = 0.5 * np.max(maxs - mins)
+    radius = max(float(radius), 1e-3)
+
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    
 def assemble(args) -> None:
     ensure_dir(args.assembly_dir)
     subgraphs = load_subgraphs(args.subgraphs_path)
@@ -1383,6 +1468,110 @@ def assemble(args) -> None:
 
         logging.info("Assembled graph %03d | points=%d | missing_nodes=%d", g_id, len(assembled), missing)
 
+def sample_and_plot(args) -> None:
+    ensure_dir(args.sample_plot_dir)
+
+    _, trainer, meta = ddpm_load_for_sampling(args.ddpm_ckpt_dir)
+    device = trainer.device
+    ae = load_ae_for_decode(args.ae_ckpt_dir, prefer_best=True, device=device)
+
+    ensure_file(args.obb_vectors)
+    ensure_file(args.curvatures)
+    ensure_file(args.scale_coeffs)
+
+    obb_all = np.load(args.obb_vectors).astype(np.float32)
+    curv_all = np.load(args.curvatures).astype(np.float32).reshape(-1)
+    scale_all = np.load(args.scale_coeffs).astype(np.float32).reshape(-1)
+
+    idx = int(args.sample_index)
+    n = min(len(obb_all), len(curv_all), len(scale_all))
+    if idx < 0 or idx >= n:
+        raise IndexError(f"sample_index={idx} out of bounds for conditioning arrays of length {n}")
+
+    forced_curv = float(np.max(curv_all))
+    forced_scale = float(np.max(scale_all))
+    cond = _node_condition_vector(
+        obb_all[idx],
+        forced_curv,#float(curv_all[idx]),
+        forced_scale,#float(scale_all[idx]),
+        meta,
+    )
+
+    feature_size = int(meta["feature_size"])
+    latent_max = float(meta["latent_max"])
+
+    cond_t = torch.from_numpy(cond[None, :]).to(device=device, dtype=torch.float32)
+    x_init = torch.randn((1, 1, feature_size, feature_size), device=device, dtype=torch.float32)
+
+    with torch.no_grad():
+        latent_t = trainer.sample(x_init, cond_t)
+
+    latent_np = latent_t.detach().cpu().numpy()
+    latent_np = postprocess_latent_np(latent_np, latent_max)[0, 0]
+
+    z = torch.from_numpy(latent_np[None, ...]).to(device=device, dtype=torch.float32)
+    with torch.no_grad():
+        decoded_local = ae.decoder(z).squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+    translation = np.zeros(3, dtype=np.float32)
+    generated_world = transform_pointcloud(decoded_local, obb_all[idx], translation)
+
+    gt_world = None
+    if Path(args.pointcloud_path).exists():
+        gt_all = np.load(args.pointcloud_path).astype(np.float32)
+        if idx < len(gt_all):
+            gt_world = transform_pointcloud(gt_all[idx], obb_all[idx], translation)
+
+    fig = plt.figure(figsize=(12, 6))
+
+    ax1 = fig.add_subplot(1, 2, 1, projection="3d")
+    if gt_world is not None:
+        ax1.scatter(gt_world[:, 0], gt_world[:, 1], gt_world[:, 2], s=1, c="black")
+        plot_obb_wireframe(ax1, obb_all[idx], translation, color="r")
+        set_axes_equal_3d(ax1, np.vstack([gt_world[:, :3], obb_corners_world(obb_all[idx], translation)]))
+        ax1.set_title(f"GT in conditioning OBB | idx={idx}")
+    else:
+        ax1.scatter(generated_world[:, 0], generated_world[:, 1], generated_world[:, 2], s=1, c="black")
+        plot_obb_wireframe(ax1, obb_all[idx], translation, color="r")
+        set_axes_equal_3d(ax1, np.vstack([generated_world[:, :3], obb_corners_world(obb_all[idx], translation)]))
+        ax1.set_title(f"Generated in conditioning OBB | idx={idx}")
+
+    ax1.set_xlabel("X")
+    ax1.set_ylabel("Y")
+    ax1.set_zlabel("Z")
+
+    ax2 = fig.add_subplot(1, 2, 2, projection="3d")
+    ax2.scatter(generated_world[:, 0], generated_world[:, 1], generated_world[:, 2], s=1, c="black")
+    plot_obb_wireframe(ax2, obb_all[idx], translation, color="r")
+    set_axes_equal_3d(ax2, np.vstack([generated_world[:, :3], obb_corners_world(obb_all[idx], translation)]))
+    ax2.set_title(f"Generated in conditioning OBB | idx={idx}")
+    ax2.set_xlabel("X")
+    ax2.set_ylabel("Y")
+    ax2.set_zlabel("Z")
+
+    plt.tight_layout()
+
+    out_png = Path(args.sample_plot_dir) / f"sample_{idx:05d}.png"
+    out_npz = Path(args.sample_plot_dir) / f"sample_{idx:05d}.npz"
+
+    fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    np.savez(
+        out_npz,
+        sample_index=idx,
+        cond=cond.astype(np.float32),
+        obb=obb_all[idx].astype(np.float32),
+        curvature=np.float32(curv_all[idx]),
+        scale=np.float32(scale_all[idx]),
+        latent=latent_np.astype(np.float32),
+        decoded_local=decoded_local.astype(np.float32),
+        generated_world=generated_world.astype(np.float32),
+        gt_world=gt_world.astype(np.float32) if gt_world is not None else np.zeros((0, 6), dtype=np.float32),
+    )
+
+    logging.info("Saved sample plot to %s", out_png)
+    logging.info("Saved sample arrays to %s", out_npz)
 
 # -----------------------------
 # CLI
@@ -1455,6 +1644,13 @@ def build_parser():
     p_asm.add_argument("--assembly_dir", default=DEFAULT_ASSEMBLY_DIR)
     p_asm.add_argument("--export_ply", action="store_true")
 
+    p_sample = sub.add_parser("sample_and_plot", help="Sample one conditional latent, decode it, and plot it inside its conditioning OBB")
+    add_common_paths(p_sample)
+    p_sample.add_argument("--ddpm_ckpt_dir", default=DEFAULT_DDPM_CKPT_DIR)
+    p_sample.add_argument("--ae_ckpt_dir", default=DEFAULT_AE_CKPT_DIR)
+    p_sample.add_argument("--sample_index", type=int, required=True)
+    p_sample.add_argument("--sample_plot_dir", default=DEFAULT_SAMPLE_PLOT_DIR)
+
     p_all = sub.add_parser("run_all", help="Run full pipeline")
     add_common_paths(p_all)
     p_all.add_argument("--ddpm_ckpt_dir", default=DEFAULT_DDPM_CKPT_DIR)
@@ -1516,6 +1712,8 @@ def main():
         decode_latents(args)
     elif args.cmd == "assemble":
         assemble(args)
+    elif args.cmd == "sample_and_plot":
+        sample_and_plot(args)
     elif args.cmd == "run_all":
         run_all(args)
     else:
