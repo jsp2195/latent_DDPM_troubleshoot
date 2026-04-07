@@ -11,20 +11,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-import tensorflow as tf
-from tensorflow import einsum
-from tensorflow.keras import Sequential
-from tensorflow.keras.layers import Layer
-import tensorflow.keras.layers as nn
-from tensorflow.keras.layers import GroupNormalization
-
 import torch
 import torch.nn as tnn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from einops import rearrange
-from einops.layers.tensorflow import Rearrange
 
 '''
 python3 DDPM_PCAE_claude.py train_ae \
@@ -130,7 +122,6 @@ def setup_logging(verbose: bool = False) -> None:
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    tf.random.set_seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -263,9 +254,9 @@ def build_ddpm_arrays(
     return encoded.astype(np.float32), labels, lbl_stats, lat_stats
 
 
-def preprocess_latent_tf(x: tf.Tensor, latent_max: float) -> tf.Tensor:
-    x = tf.cast(x, tf.float32)
-    return tf.clip_by_value(x / latent_max, -1.0, 1.0)
+def preprocess_latent_torch(x: torch.Tensor, latent_max: float) -> torch.Tensor:
+    x = x.to(dtype=torch.float32)
+    return torch.clamp(x / latent_max, -1.0, 1.0)
 
 
 def postprocess_latent_np(x: np.ndarray, latent_max: float) -> np.ndarray:
@@ -285,175 +276,173 @@ def default(val, d):
     return d() if callable(d) else d
 
 
-class SinusoidalPosEmb(Layer):
+class SinusoidalPosEmb(tnn.Module):
     def __init__(self, dim, max_positions=10000):
         super().__init__()
         self.dim = dim
         self.max_positions = max_positions
 
-    def call(self, x, training=True):
+    def forward(self, x):
         half_dim = self.dim // 2
         inv_freq_scale = math.log(self.max_positions) / max(half_dim - 1, 1)
-        positions = tf.cast(tf.range(half_dim), x.dtype)
-        emb = tf.exp(positions * -inv_freq_scale)
-        emb = tf.cast(x[:, None], emb.dtype) * emb[None, :]
-        return tf.concat([tf.sin(emb), tf.cos(emb)], axis=-1)
+        positions = torch.arange(half_dim, device=x.device, dtype=x.dtype)
+        emb = torch.exp(positions * -inv_freq_scale)
+        emb = x[:, None].to(emb.dtype) * emb[None, :]
+        return torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
 
 
-class Identity(Layer):
-    def call(self, x, training=True):
-        return tf.identity(x)
+class Identity(tnn.Module):
+    def forward(self, x, *args, **kwargs):
+        return x
 
 
-class Residual(Layer):
+class Residual(tnn.Module):
     def __init__(self, fn):
         super().__init__()
         self.fn = fn
 
-    def call(self, x, training=True):
-        return self.fn(x, training=training) + x
+    def forward(self, x, *args, **kwargs):
+        return self.fn(x, *args, **kwargs) + x
 
 
 def Upsample(dim):
-    return nn.Conv2DTranspose(filters=dim, kernel_size=4, strides=2, padding="SAME")
+    return tnn.ConvTranspose2d(dim, dim, kernel_size=4, stride=2, padding=1)
 
 
 def Downsample(dim):
-    return nn.Conv2D(filters=dim, kernel_size=4, strides=2, padding="SAME")
+    return tnn.Conv2d(dim, dim, kernel_size=4, stride=2, padding=1)
 
 
-class LayerNorm(Layer):
-    def __init__(self, dim, eps=1e-5, **kwargs):
-        super().__init__(**kwargs)
+class LayerNorm(tnn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
         self.eps = eps
-        self.g = self.add_weight(name="g", shape=[1, 1, 1, dim], initializer="ones", trainable=True)
-        self.b = self.add_weight(name="b", shape=[1, 1, 1, dim], initializer="zeros", trainable=True)
+        self.g = tnn.Parameter(torch.ones(1, dim, 1, 1))
+        self.b = tnn.Parameter(torch.zeros(1, dim, 1, 1))
 
-    def call(self, x, training=True):
-        var = tf.math.reduce_variance(x, axis=-1, keepdims=True)
-        mean = tf.reduce_mean(x, axis=-1, keepdims=True)
-        return (x - mean) / tf.sqrt(var + self.eps) * self.g + self.b
+    def forward(self, x):
+        var = torch.var(x, dim=1, unbiased=False, keepdim=True)
+        mean = torch.mean(x, dim=1, keepdim=True)
+        return (x - mean) / torch.sqrt(var + self.eps) * self.g + self.b
 
 
-class PreNorm(Layer):
+class PreNorm(tnn.Module):
     def __init__(self, dim, fn):
         super().__init__()
         self.fn = fn
         self.norm = LayerNorm(dim)
 
-    def call(self, x, training=True):
-        return self.fn(self.norm(x), training=training)
+    def forward(self, x, *args, **kwargs):
+        return self.fn(self.norm(x), *args, **kwargs)
 
 
-class SiLU(Layer):
-    def call(self, x, training=True):
-        return x * tf.nn.sigmoid(x)
+class SiLU(tnn.Module):
+    def forward(self, x):
+        return F.silu(x)
 
 
-class GELU(Layer):
-    def call(self, x, training=True):
-        return tf.keras.activations.gelu(x)
+class GELU(tnn.Module):
+    def forward(self, x):
+        return F.gelu(x)
 
 
-class Block(Layer):
-    def __init__(self, dim, groups=8):
+class Block(tnn.Module):
+    def __init__(self, dim, dim_out=None, groups=8):
         super().__init__()
-        self.proj = nn.Conv2D(dim, kernel_size=3, strides=1, padding="SAME")
-        self.norm = GroupNormalization(groups=min(groups, dim), epsilon=1e-5)
+        dim_out = default(dim_out, dim)
+        self.proj = tnn.Conv2d(dim, dim_out, kernel_size=3, stride=1, padding=1)
+        self.norm = tnn.GroupNorm(num_groups=min(groups, dim_out), num_channels=dim_out, eps=1e-5)
         self.act = SiLU()
 
-    def call(self, x, gamma_beta=None, training=True):
+    def forward(self, x, gamma_beta=None):
         x = self.proj(x)
-        x = self.norm(x, training=training)
+        x = self.norm(x)
         if exists(gamma_beta):
             gamma, beta = gamma_beta
             x = x * (gamma + 1.0) + beta
         return self.act(x)
 
 
-class ResnetBlock(Layer):
+class ResnetBlock(tnn.Module):
     def __init__(self, dim, dim_out, time_emb_dim=None, groups=8):
         super().__init__()
-        self.mlp = Sequential([SiLU(), nn.Dense(units=dim_out * 2)]) if exists(time_emb_dim) else None
-        self.block1 = Block(dim_out, groups=groups)
+        self.mlp = tnn.Sequential(SiLU(), tnn.Linear(time_emb_dim, dim_out * 2)) if exists(time_emb_dim) else None
+        self.block1 = Block(dim, dim_out, groups=groups)
         self.block2 = Block(dim_out, groups=groups)
-        self.res_conv = nn.Conv2D(filters=dim_out, kernel_size=1, strides=1) if dim != dim_out else Identity()
+        self.res_conv = tnn.Conv2d(dim, dim_out, kernel_size=1, stride=1) if dim != dim_out else Identity()
 
-    def call(self, x, time_emb=None, training=True):
+    def forward(self, x, time_emb=None):
         gamma_beta = None
         if exists(self.mlp) and exists(time_emb):
             time_emb = self.mlp(time_emb)
-            time_emb = rearrange(time_emb, "b c -> b 1 1 c")
-            gamma_beta = tf.split(time_emb, num_or_size_splits=2, axis=-1)
-        h = self.block1(x, gamma_beta=gamma_beta, training=training)
-        h = self.block2(h, training=training)
+            time_emb = rearrange(time_emb, "b c -> b c 1 1")
+            gamma_beta = torch.chunk(time_emb, chunks=2, dim=1)
+        h = self.block1(x, gamma_beta=gamma_beta)
+        h = self.block2(h)
         return h + self.res_conv(x)
 
 
-class LinearAttention(Layer):
+class LinearAttention(tnn.Module):
     def __init__(self, dim, heads=4, dim_head=32):
         super().__init__()
         self.scale = dim_head ** -0.5
         self.heads = heads
         self.hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2D(filters=self.hidden_dim * 3, kernel_size=1, strides=1, use_bias=False)
-        self.to_out = Sequential([nn.Conv2D(filters=dim, kernel_size=1, strides=1), LayerNorm(dim)])
+        self.to_qkv = tnn.Conv2d(dim, self.hidden_dim * 3, kernel_size=1, stride=1, bias=False)
+        self.to_out = tnn.Sequential(tnn.Conv2d(self.hidden_dim, dim, kernel_size=1, stride=1), LayerNorm(dim))
 
-    def call(self, x, training=True):
-        b = tf.shape(x)[0]
-        h = tf.shape(x)[1]
-        w = tf.shape(x)[2]
-        qkv = tf.split(self.to_qkv(x), num_or_size_splits=3, axis=-1)
-        q, k, v = map(lambda t: rearrange(t, "b x y (hh c) -> b hh c (x y)", hh=self.heads), qkv)
-        q = tf.nn.softmax(q, axis=-2) * self.scale
-        k = tf.nn.softmax(k, axis=-1)
-        context = einsum("b h d n, b h e n -> b h d e", k, v)
-        out = einsum("b h d e, b h d n -> b h e n", context, q)
-        out = rearrange(out, "b hh c (x y) -> b x y (hh c)", hh=self.heads, x=h, y=w)
-        return self.to_out(out, training=training)
+    def forward(self, x):
+        h, w = x.shape[2], x.shape[3]
+        qkv = torch.chunk(self.to_qkv(x), chunks=3, dim=1)
+        q, k, v = map(lambda t: rearrange(t, "b (hh c) x y -> b hh c (x y)", hh=self.heads), qkv)
+        q = torch.softmax(q, dim=-2) * self.scale
+        k = torch.softmax(k, dim=-1)
+        context = torch.einsum("b h d n, b h e n -> b h d e", k, v)
+        out = torch.einsum("b h d e, b h d n -> b h e n", context, q)
+        out = rearrange(out, "b hh c (x y) -> b (hh c) x y", hh=self.heads, x=h, y=w)
+        return self.to_out(out)
 
 
-class Attention(Layer):
+class Attention(tnn.Module):
     def __init__(self, dim, heads=4, dim_head=32):
         super().__init__()
         self.scale = dim_head ** -0.5
         self.heads = heads
         self.hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2D(filters=self.hidden_dim * 3, kernel_size=1, strides=1, use_bias=False)
-        self.to_out = nn.Conv2D(filters=dim, kernel_size=1, strides=1)
+        self.to_qkv = tnn.Conv2d(dim, self.hidden_dim * 3, kernel_size=1, stride=1, bias=False)
+        self.to_out = tnn.Conv2d(self.hidden_dim, dim, kernel_size=1, stride=1)
 
-    def call(self, x, training=True):
-        h = tf.shape(x)[1]
-        w = tf.shape(x)[2]
-        qkv = tf.split(self.to_qkv(x), num_or_size_splits=3, axis=-1)
-        q, k, v = map(lambda t: rearrange(t, "b x y (hh c) -> b hh c (x y)", hh=self.heads), qkv)
+    def forward(self, x):
+        h, w = x.shape[2], x.shape[3]
+        qkv = torch.chunk(self.to_qkv(x), chunks=3, dim=1)
+        q, k, v = map(lambda t: rearrange(t, "b (hh c) x y -> b hh c (x y)", hh=self.heads), qkv)
         q = q * self.scale
-        sim = einsum("b h d i, b h d j -> b h i j", q, k)
-        attn = tf.nn.softmax(sim, axis=-1)
-        out = einsum("b h i j, b h d j -> b h i d", attn, v)
-        out = rearrange(out, "b hh (x y) d -> b x y (hh d)", hh=self.heads, x=h, y=w)
-        return self.to_out(out, training=training)
+        sim = torch.einsum("b h d i, b h d j -> b h i j", q, k)
+        attn = torch.softmax(sim, dim=-1)
+        out = torch.einsum("b h i j, b h d j -> b h i d", attn, v)
+        out = rearrange(out, "b hh (x y) d -> b (hh d) x y", hh=self.heads, x=h, y=w)
+        return self.to_out(out)
 
 
-class MLP(Layer):
-    def __init__(self, hidden_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.net = Sequential([
-            Rearrange("... -> ... 1"),
-            nn.Dense(units=hidden_dim),
+class MLP(tnn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.net = tnn.Sequential(
+            tnn.Linear(1, hidden_dim),
             GELU(),
-            LayerNorm(hidden_dim),
-            nn.Dense(units=hidden_dim),
+            tnn.LayerNorm(hidden_dim),
+            tnn.Linear(hidden_dim, hidden_dim),
             GELU(),
-            LayerNorm(hidden_dim),
-            nn.Dense(units=hidden_dim),
-        ])
+            tnn.LayerNorm(hidden_dim),
+            tnn.Linear(hidden_dim, hidden_dim),
+        )
 
-    def call(self, x, training=True):
-        return self.net(x, training=training)
+    def forward(self, x):
+        x = x.unsqueeze(-1)
+        return self.net(x)
 
 
-class UnetConditional(tf.keras.Model):
+class UnetConditional(tnn.Module):
     def __init__(
         self,
         dim=64,
@@ -480,41 +469,38 @@ class UnetConditional(tf.keras.Model):
         self.scale_length = scale_length
 
         init_dim = init_dim if init_dim is not None else dim // 2
-        self.init_conv = tf.keras.layers.Conv2D(filters=init_dim, kernel_size=7, strides=1, padding="SAME")
+        self.init_conv = tnn.Conv2d(channels, init_dim, kernel_size=7, stride=1, padding=3)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
         time_dim = dim * 4
-        self.time_mlp = tf.keras.Sequential(
-            [
-                SinusoidalPosEmb(dim),
-                tf.keras.layers.Dense(units=time_dim),
-                tf.keras.layers.Activation("gelu"),
-                tf.keras.layers.Dense(units=time_dim),
-            ],
-            name="time_embeddings",
+        self.time_mlp = tnn.Sequential(
+            SinusoidalPosEmb(dim),
+            tnn.Linear(dim, time_dim),
+            tnn.GELU(),
+            tnn.Linear(time_dim, time_dim),
         ) if sinusoidal_cond_mlp else MLP(time_dim)
 
-        self.obb_embedding = tf.keras.layers.Dense(units=class_emb_dim_obb)
-        self.curvature_embedding = tf.keras.layers.Dense(units=class_emb_dim_curvature)
-        self.scale_embedding = tf.keras.layers.Dense(units=class_emb_dim_scale)
+        self.obb_embedding = tnn.Linear(obb_length, class_emb_dim_obb)
+        self.curvature_embedding = tnn.Linear(curvature_length, class_emb_dim_curvature)
+        self.scale_embedding = tnn.Linear(scale_length, class_emb_dim_scale)
 
         block_klass = lambda din, dout, tdim: ResnetBlock(din, dout, time_emb_dim=tdim, groups=resnet_block_groups)
 
-        self.downs = []
-        self.ups = []
+        self.downs = tnn.ModuleList()
+        self.ups = tnn.ModuleList()
         num_resolutions = len(in_out)
 
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind == (num_resolutions - 1)
-            self.downs.append([
+            self.downs.append(tnn.ModuleList([
                 block_klass(dim_in, dim_out, time_dim),
                 block_klass(dim_out, dim_out, time_dim),
                 block_klass(dim_out, dim_out, time_dim),
                 Residual(PreNorm(dim_out, LinearAttention(dim_out))),
                 Downsample(dim_out) if not is_last else Identity(),
-            ])
+            ]))
 
         mid_dim = dims[-1]
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_dim)
@@ -523,49 +509,49 @@ class UnetConditional(tf.keras.Model):
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
             is_last = ind == (num_resolutions - 1)
-            self.ups.append([
+            self.ups.append(tnn.ModuleList([
                 block_klass(dim_out * 2, dim_in, time_dim),
                 block_klass(dim_in, dim_in, time_dim),
                 block_klass(dim_in, dim_in, time_dim),
                 Residual(PreNorm(dim_in, LinearAttention(dim_in))),
                 Upsample(dim_in) if not is_last else Identity(),
-            ])
+            ]))
 
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, lambda: default_out_dim)
-        self.final_conv = tf.keras.Sequential([block_klass(dim * 2, dim, time_dim), tf.keras.layers.Conv2D(filters=self.out_dim, kernel_size=1, strides=1)], name="output")
+        self.final_conv = tnn.Sequential(block_klass(dim * 2, dim, time_dim), tnn.Conv2d(dim, self.out_dim, kernel_size=1, stride=1))
 
-    def call(self, x, time=None, class_value=None, training=True, **kwargs):
+    def forward(self, x, time=None, class_value=None):
         x = self.init_conv(x)
-        t = self.time_mlp(tf.cast(time, tf.float32))
-        obb, curvature, scale = tf.split(class_value, [self.obb_length, self.curvature_length, self.scale_length], axis=-1)
-        class_emb = tf.concat([
+        t = self.time_mlp(time.to(torch.float32))
+        obb, curvature, scale = torch.split(class_value, [self.obb_length, self.curvature_length, self.scale_length], dim=-1)
+        class_emb = torch.cat([
             self.obb_embedding(obb),
             self.curvature_embedding(curvature),
             self.scale_embedding(scale),
-        ], axis=-1)
-        t = tf.concat([t, class_emb], axis=-1)
+        ], dim=-1)
+        t = torch.cat([t, class_emb], dim=-1)
 
         h = []
         for block1, block2, block3, attn, downsample in self.downs:
-            x = block1(x, t, training=training)
-            x = block2(x, t, training=training)
-            x = block3(x, t, training=training)
-            x = attn(x, training=training)
+            x = block1(x, t)
+            x = block2(x, t)
+            x = block3(x, t)
+            x = attn(x)
             h.append(x)
-            x = downsample(x, training=training)
+            x = downsample(x)
 
-        x = self.mid_block1(x, t, training=training)
-        x = self.mid_attn(x, training=training)
-        x = self.mid_block2(x, t, training=training)
+        x = self.mid_block1(x, t)
+        x = self.mid_attn(x)
+        x = self.mid_block2(x, t)
 
         for block1, block2, block3, attn, upsample in self.ups:
-            x = tf.concat([x, h.pop()], axis=-1)
-            x = block1(x, t, training=training)
-            x = block2(x, t, training=training)
-            x = block3(x, t, training=training)
-            x = attn(x, training=training)
-            x = upsample(x, training=training)
+            x = torch.cat([x, h.pop()], dim=1)
+            x = block1(x, t)
+            x = block2(x, t)
+            x = block3(x, t)
+            x = attn(x)
+            x = upsample(x)
 
         return self.final_conv(x)
 
@@ -574,115 +560,100 @@ class UnetConditional(tf.keras.Model):
 # DDPM train / eval / sample
 # -----------------------------
 class DDPMTrainer:
-    def __init__(self, model: UnetConditional, timesteps: int = TIMESTEPS, beta_start: float = BETA_START, beta_end: float = BETA_END):
+    def __init__(self, model: UnetConditional, timesteps: int = TIMESTEPS, beta_start: float = BETA_START, beta_end: float = BETA_END, device: Optional[torch.device] = None):
         self.model = model
         self.timesteps = timesteps
+        self.device = device or next(model.parameters()).device
         beta = np.linspace(beta_start, beta_end, timesteps, dtype=np.float32)
         alpha = 1.0 - beta
         alpha_bar = np.cumprod(alpha, axis=0)
 
-        self.alpha_tf = tf.constant(alpha, dtype=tf.float32)
-        self.alpha_bar_tf = tf.constant(alpha_bar, dtype=tf.float32)
-        self.beta_tf = tf.constant(beta, dtype=tf.float32)
-        self.sqrt_alpha_bar = tf.constant(np.sqrt(alpha_bar), dtype=tf.float32)
-        self.sqrt_one_minus_alpha_bar = tf.constant(np.sqrt(1.0 - alpha_bar), dtype=tf.float32)
+        self.alpha_t = torch.tensor(alpha, dtype=torch.float32, device=self.device)
+        self.alpha_bar_t = torch.tensor(alpha_bar, dtype=torch.float32, device=self.device)
+        self.beta_t = torch.tensor(beta, dtype=torch.float32, device=self.device)
+        self.sqrt_alpha_bar = torch.tensor(np.sqrt(alpha_bar), dtype=torch.float32, device=self.device)
+        self.sqrt_one_minus_alpha_bar = torch.tensor(np.sqrt(1.0 - alpha_bar), dtype=torch.float32, device=self.device)
 
-    @tf.function
     def forward_noise(self, x0, t):
-        noise = tf.random.normal(tf.shape(x0), dtype=x0.dtype)
-        sa = tf.cast(tf.gather(self.sqrt_alpha_bar, t), x0.dtype)[:, None, None, None]
-        osa = tf.cast(tf.gather(self.sqrt_one_minus_alpha_bar, t), x0.dtype)[:, None, None, None]
+        noise = torch.randn_like(x0)
+        sa = self.sqrt_alpha_bar[t].to(x0.dtype)[:, None, None, None]
+        osa = self.sqrt_one_minus_alpha_bar[t].to(x0.dtype)[:, None, None, None]
         xt = sa * x0 + osa * noise
         return xt, noise
 
     @staticmethod
-    @tf.function
     def loss_fn(real_noise, pred_noise):
-        pred_noise = tf.cast(pred_noise, real_noise.dtype)
-        return tf.reduce_mean(tf.math.squared_difference(real_noise, pred_noise))
+        pred_noise = pred_noise.to(real_noise.dtype)
+        return F.mse_loss(pred_noise, real_noise)
 
-    @tf.function
     def train_step(self, opt, batch_x, batch_c, p_uncond=0.1):
-        b = tf.shape(batch_x)[0]
-        t = tf.random.uniform([b], minval=0, maxval=self.timesteps, dtype=tf.int32)
+        b = batch_x.shape[0]
+        t = torch.randint(0, self.timesteps, (b,), device=batch_x.device, dtype=torch.long)
         xt, noise = self.forward_noise(batch_x, t)
 
         # Classifier-free guidance: randomly drop condition (Eq. 29)
-        mask = tf.cast(tf.random.uniform([b, 1]) >= p_uncond, batch_c.dtype)
+        mask = (torch.rand((b, 1), device=batch_c.device) >= p_uncond).to(batch_c.dtype)
         batch_c_masked = batch_c * mask
 
-        with tf.GradientTape() as tape:
-            pred = self.model(xt, t, batch_c_masked, training=True)
-            loss = self.loss_fn(noise, pred)
-        grads = tape.gradient(loss, self.model.trainable_variables)
-        opt.apply_gradients(zip(grads, self.model.trainable_variables))
+        opt.zero_grad(set_to_none=True)
+        pred = self.model(xt, t, batch_c_masked)
+        loss = self.loss_fn(noise, pred)
+        loss.backward()
+        opt.step()
         return loss
 
-    @tf.function
     def val_step(self, batch_x, batch_c):
-        b = tf.shape(batch_x)[0]
-        t = tf.random.uniform([b], minval=0, maxval=self.timesteps, dtype=tf.int32)
+        b = batch_x.shape[0]
+        t = torch.randint(0, self.timesteps, (b,), device=batch_x.device, dtype=torch.long)
         xt, noise = self.forward_noise(batch_x, t)
-        pred = self.model(xt, t, batch_c, training=False)
+        pred = self.model(xt, t, batch_c)
         return self.loss_fn(noise, pred)
 
-    @tf.function
     def reverse_step(self, x_t, pred_noise, t):
-        t = tf.cast(tf.reshape(t, [-1]), tf.int32)
-        a_t = tf.cast(tf.gather(self.alpha_tf, t), x_t.dtype)[:, None, None, None]
-        ab_t = tf.cast(tf.gather(self.alpha_bar_tf, t), x_t.dtype)[:, None, None, None]
-        b_t = tf.cast(tf.gather(self.beta_tf, t), x_t.dtype)[:, None, None, None]
-        one = tf.constant(1.0, dtype=x_t.dtype)
-        eps_coef = (one - a_t) / tf.sqrt(one - ab_t)
-        mean = (one / tf.sqrt(a_t)) * (x_t - eps_coef * pred_noise)
-        noise = tf.random.normal(tf.shape(x_t), dtype=x_t.dtype)
-        return mean + tf.sqrt(b_t) * noise
+        t = t.reshape(-1).long()
+        a_t = self.alpha_t[t].to(x_t.dtype)[:, None, None, None]
+        ab_t = self.alpha_bar_t[t].to(x_t.dtype)[:, None, None, None]
+        b_t = self.beta_t[t].to(x_t.dtype)[:, None, None, None]
+        one = torch.tensor(1.0, dtype=x_t.dtype, device=x_t.device)
+        eps_coef = (one - a_t) / torch.sqrt(one - ab_t)
+        mean = (one / torch.sqrt(a_t)) * (x_t - eps_coef * pred_noise)
+        noise = torch.randn_like(x_t)
+        return mean + torch.sqrt(b_t) * noise
 
-    @tf.function
     def _guidance_weight(self, t):
         """Corrected Eq. 32: guidance strong early (high t), diminishing as denoising proceeds."""
-        T = tf.cast(self.timesteps, tf.float32)
-        t_f = tf.cast(t, tf.float32)
+        T = torch.tensor(float(self.timesteps), dtype=torch.float32, device=self.device)
+        t_f = torch.as_tensor(t, dtype=torch.float32, device=self.device)
         w_min, w_max, lam = 0.2, 0.7, 5.0
-        return w_min + (w_max - w_min) * tf.exp(-lam * (T - t_f) / T)
+        return w_min + (w_max - w_min) * torch.exp(-lam * (T - t_f) / T)
 
-    @tf.function
     def _reverse_step_no_noise(self, x_t, pred_noise, t):
         """Reverse step returning mean only (no stochastic noise). Used at t=0."""
-        t = tf.cast(tf.reshape(t, [-1]), tf.int32)
-        a_t = tf.cast(tf.gather(self.alpha_tf, t), x_t.dtype)[:, None, None, None]
-        ab_t = tf.cast(tf.gather(self.alpha_bar_tf, t), x_t.dtype)[:, None, None, None]
-        one = tf.constant(1.0, dtype=x_t.dtype)
-        eps_coef = (one - a_t) / tf.sqrt(one - ab_t)
-        return (one / tf.sqrt(a_t)) * (x_t - eps_coef * pred_noise)
+        t = t.reshape(-1).long()
+        a_t = self.alpha_t[t].to(x_t.dtype)[:, None, None, None]
+        ab_t = self.alpha_bar_t[t].to(x_t.dtype)[:, None, None, None]
+        one = torch.tensor(1.0, dtype=x_t.dtype, device=x_t.device)
+        eps_coef = (one - a_t) / torch.sqrt(one - ab_t)
+        return (one / torch.sqrt(a_t)) * (x_t - eps_coef * pred_noise)
 
-    @tf.function
     def sample(self, x_init, class_vec):
         x = x_init
-        b = tf.shape(x_init)[0]
-        uncond_vec = tf.zeros_like(class_vec)
+        b = x_init.shape[0]
+        uncond_vec = torch.zeros_like(class_vec)
 
-        def cond(i, _x):
-            return i > 0  # Stop before t=0; final step handled separately
-
-        def body(i, _x):
-            t = tf.fill([b], tf.cast(i, tf.int32))
-            # Classifier-free guidance (Eq. 31)
-            eps_cond = self.model(_x, t, class_vec, training=False)
-            eps_uncond = self.model(_x, t, uncond_vec, training=False)
-            w = self._guidance_weight(i)
+        for i in range(self.timesteps - 1, 0, -1):
+            t = torch.full((b,), i, dtype=torch.long, device=x.device)
+            eps_cond = self.model(x, t, class_vec)
+            eps_uncond = self.model(x, t, uncond_vec)
+            w = self._guidance_weight(i).to(x.dtype)
             guided = eps_cond + w * (eps_cond - eps_uncond)
-            _x = self.reverse_step(_x, guided, t)
-            return i - 1, _x
-
-        i0 = tf.constant(self.timesteps - 1, dtype=tf.int32)
-        _, x = tf.while_loop(cond, body, [i0, x], shape_invariants=[i0.get_shape(), tf.TensorShape([None, None, None, 1])])
+            x = self.reverse_step(x, guided, t)
 
         # Final step t=0: no noise (Ho et al. 2020, Alg. 2: z=0 when t=1)
-        t0 = tf.fill([b], tf.constant(0, tf.int32))
-        eps_cond = self.model(x, t0, class_vec, training=False)
-        eps_uncond = self.model(x, t0, uncond_vec, training=False)
-        w = self._guidance_weight(0)
+        t0 = torch.zeros((b,), dtype=torch.long, device=x.device)
+        eps_cond = self.model(x, t0, class_vec)
+        eps_uncond = self.model(x, t0, uncond_vec)
+        w = self._guidance_weight(0).to(x.dtype)
         guided = eps_cond + w * (eps_cond - eps_uncond)
         x = self._reverse_step_no_noise(x, guided, t0)
         return x
@@ -690,14 +661,34 @@ class DDPMTrainer:
 
 def build_ddpm_model(feature_size: int) -> UnetConditional:
     model = UnetConditional(in_res=feature_size)
-    dummy_x = tf.zeros((1, feature_size, feature_size, 1), dtype=tf.float32)
-    dummy_t = tf.zeros((1,), dtype=tf.int32)
-    dummy_c = tf.zeros((1, 8), dtype=tf.float32)
-    _ = model(dummy_x, dummy_t, dummy_c, training=False)
+    dummy_x = torch.zeros((1, 1, feature_size, feature_size), dtype=torch.float32)
+    dummy_t = torch.zeros((1,), dtype=torch.long)
+    dummy_c = torch.zeros((1, 8), dtype=torch.float32)
+    _ = model(dummy_x, dummy_t, dummy_c)
     return model
 
 
-def make_tf_datasets(X: np.ndarray, Y: np.ndarray, batch_size: int, latent_max: float, val_split: float, seed: int):
+class DDPMDataset(Dataset):
+    def __init__(self, x: np.ndarray, y: np.ndarray, latent_max: float):
+        self.x = x.astype(np.float32)
+        self.y = y.astype(np.float32)
+        self.latent_max = latent_max
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, idx):
+        x = torch.from_numpy(self.x[idx]).float()
+        if x.ndim == 3 and x.shape[-1] == 1:
+            x = x.permute(2, 0, 1).contiguous()
+        elif x.ndim == 2:
+            x = x.unsqueeze(0)
+        x = preprocess_latent_torch(x, self.latent_max)
+        y = torch.from_numpy(self.y[idx]).float()
+        return x, y
+
+
+def make_torch_dataloaders(X: np.ndarray, Y: np.ndarray, batch_size: int, latent_max: float, val_split: float, seed: int):
     n = len(X)
     idx = np.arange(n)
     rng = np.random.default_rng(seed)
@@ -708,14 +699,12 @@ def make_tf_datasets(X: np.ndarray, Y: np.ndarray, batch_size: int, latent_max: 
     Xtr, Ytr = X[tr_idx], Y[tr_idx]
     Xva, Yva = X[va_idx], Y[va_idx]
 
-    def _map(x, y):
-        x = preprocess_latent_tf(x, latent_max)
-        y = tf.cast(y, tf.float32)
-        return x, y
-
-    train_ds = tf.data.Dataset.from_tensor_slices((Xtr, Ytr)).shuffle(len(Xtr), seed=seed).map(_map, num_parallel_calls=tf.data.AUTOTUNE).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    val_ds = tf.data.Dataset.from_tensor_slices((Xva, Yva)).map(_map, num_parallel_calls=tf.data.AUTOTUNE).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    return train_ds, val_ds
+    train_ds = DDPMDataset(Xtr, Ytr, latent_max)
+    val_ds = DDPMDataset(Xva, Yva, latent_max)
+    gen = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, generator=gen, num_workers=0, pin_memory=torch.cuda.is_available())
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=torch.cuda.is_available())
+    return train_loader, val_loader
 
 
 def train_ddpm(args) -> None:
@@ -734,27 +723,41 @@ def train_ddpm(args) -> None:
         raise ValueError(f"DDPM expects square latent grids, got {X.shape}")
 
     ensure_dir(args.ddpm_ckpt_dir)
-    train_ds, val_ds = make_tf_datasets(X, Y, args.batch_size, lat_stats.latent_max, args.val_split, args.seed)
+    train_ds, val_ds = make_torch_dataloaders(X, Y, args.batch_size, lat_stats.latent_max, args.val_split, args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = build_ddpm_model(feature_size)
-    trainer = DDPMTrainer(model, timesteps=args.timesteps, beta_start=args.beta_start, beta_end=args.beta_end)
+    model = build_ddpm_model(feature_size).to(device)
+    trainer = DDPMTrainer(model, timesteps=args.timesteps, beta_start=args.beta_start, beta_end=args.beta_end, device=device)
 
-    lr_sched = tf.keras.optimizers.schedules.ExponentialDecay(args.lr, decay_steps=10000, decay_rate=0.9, staircase=True)
-    opt = tf.keras.optimizers.Adam(learning_rate=lr_sched)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    lr_sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.9)
 
-    ckpt = tf.train.Checkpoint(unet=model, optimizer=opt)
-    manager = tf.train.CheckpointManager(ckpt, args.ddpm_ckpt_dir, max_to_keep=5)
-    if manager.latest_checkpoint:
-        ckpt.restore(manager.latest_checkpoint)
-        logging.info("Restored DDPM checkpoint: %s", manager.latest_checkpoint)
+    latest_path = os.path.join(args.ddpm_ckpt_dir, "ddpm_latest.pt")
+    start_epoch = 1
+    if os.path.exists(latest_path):
+        state = torch.load(latest_path, map_location=device)
+        model.load_state_dict(state["model"])
+        opt.load_state_dict(state["optimizer"])
+        if "scheduler" in state:
+            lr_sched.load_state_dict(state["scheduler"])
+        start_epoch = int(state.get("epoch", 0)) + 1
+        logging.info("Restored DDPM checkpoint: %s", latest_path)
 
     best_val = float("inf")
     no_improve = 0
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         tr_losses = []
         for xb, yb in train_ds:
-            tr_losses.append(float(trainer.train_step(opt, xb, yb).numpy()))
-        va_losses = [float(trainer.val_step(xb, yb).numpy()) for xb, yb in val_ds]
+            xb, yb = xb.to(device), yb.to(device)
+            tr_losses.append(float(trainer.train_step(opt, xb, yb).item()))
+
+        va_losses = []
+        model.eval()
+        with torch.no_grad():
+            for xb, yb in val_ds:
+                xb, yb = xb.to(device), yb.to(device)
+                va_losses.append(float(trainer.val_step(xb, yb).item()))
+        model.train()
 
         tr = float(np.mean(tr_losses)) if tr_losses else float("inf")
         va = float(np.mean(va_losses)) if va_losses else float("inf")
@@ -763,15 +766,19 @@ def train_ddpm(args) -> None:
         if va < best_val:
             best_val = va
             no_improve = 0
-            manager.save(checkpoint_number=epoch)
-            model.save_weights(os.path.join(args.ddpm_ckpt_dir, "unet_best.weights.h5"))
+            torch.save(model.state_dict(), os.path.join(args.ddpm_ckpt_dir, "unet_best.pt"))
         else:
             no_improve += 1
             if no_improve >= args.patience:
                 logging.info("DDPM early stopping at epoch %d", epoch)
                 break
+        torch.save(
+            {"epoch": epoch, "model": model.state_dict(), "optimizer": opt.state_dict(), "scheduler": lr_sched.state_dict(), "best_val": best_val},
+            latest_path,
+        )
+        lr_sched.step()
 
-    model.save_weights(os.path.join(args.ddpm_ckpt_dir, "unet_final.weights.h5"))
+    torch.save(model.state_dict(), os.path.join(args.ddpm_ckpt_dir, "unet_final.pt"))
     save_json(
         {
             "feature_size": feature_size,
@@ -1119,16 +1126,18 @@ def load_subgraphs(npz_path: str):
 
 def ddpm_load_for_sampling(ddpm_ckpt_dir: str) -> Tuple[UnetConditional, DDPMTrainer, Dict]:
     meta_path = os.path.join(ddpm_ckpt_dir, "ddpm_meta.json")
-    weights_path = os.path.join(ddpm_ckpt_dir, "unet_best.weights.h5")
+    weights_path = os.path.join(ddpm_ckpt_dir, "unet_best.pt")
     if not os.path.exists(weights_path):
-        weights_path = os.path.join(ddpm_ckpt_dir, "unet_final.weights.h5")
+        weights_path = os.path.join(ddpm_ckpt_dir, "unet_final.pt")
 
     meta = load_json(meta_path)
     feature_size = int(meta["feature_size"])
-    model = build_ddpm_model(feature_size)
-    model.load_weights(weights_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_ddpm_model(feature_size).to(device)
+    model.load_state_dict(torch.load(weights_path, map_location=device))
+    model.eval()
 
-    trainer = DDPMTrainer(model, timesteps=int(meta["timesteps"]), beta_start=float(meta["beta_start"]), beta_end=float(meta["beta_end"]))
+    trainer = DDPMTrainer(model, timesteps=int(meta["timesteps"]), beta_start=float(meta["beta_start"]), beta_end=float(meta["beta_end"]), device=device)
     return model, trainer, meta
 
 
@@ -1174,14 +1183,16 @@ def generate_latents(args) -> None:
         for start in range(0, n_nodes, args.gen_batch_size):
             end = min(start + args.gen_batch_size, n_nodes)
             cond = np.stack([_node_condition_vector(obb_arr[i], curv_arr[i], scale_arr[i], meta) for i in range(start, end)], axis=0)
-            cond_tf = tf.convert_to_tensor(cond, dtype=tf.float32)
-            x = tf.random.normal((end - start, feature_size, feature_size, 1), dtype=tf.float32)
-            sampled = trainer.sample(x, cond_tf).numpy()
+            device = trainer.device
+            cond_t = torch.from_numpy(cond).to(device=device, dtype=torch.float32)
+            x = torch.randn((end - start, 1, feature_size, feature_size), device=device, dtype=torch.float32)
+            with torch.no_grad():
+                sampled = trainer.sample(x, cond_t).cpu().numpy()
             sampled = postprocess_latent_np(sampled, latent_max)
 
             for i in range(end - start):
                 node_id = start + i
-                latent = sampled[i, ..., 0].astype(np.float32)
+                latent = sampled[i, 0, ...].astype(np.float32)
                 np.save(graph_dir / f"node_{node_id:03d}.npy", latent)
                 node_ids.append(node_id)
                 labels.append(cond[i])
@@ -1445,13 +1456,6 @@ def main():
 
     setup_logging(args.verbose)
     seed_everything(args.seed)
-
-    # Keep TF/PyTorch device handling isolated
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-    gpus = tf.config.list_physical_devices("GPU")
-    if gpus:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
 
     if args.cmd == "train_ddpm":
         train_ddpm(args)
