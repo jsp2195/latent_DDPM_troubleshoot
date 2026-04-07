@@ -27,7 +27,7 @@ LR = 0.0005
 num_layers = 4
 edge_loss_scale = 1.0
 node_loss_scale = 5.0      # Paper Eq. 17: λ_node = 5.0
-lambda_var = 0.01          # Paper Eq. 17: variance regularization
+lambda_var = 0.001         # Paper Eq. 17: variance regularization
 HEAD = 4
 ACCU = 4
 M = 14  # 3 pos + 1 scale + 6 sin/cos Euler + 3 OBB dims + 1 curvature
@@ -75,15 +75,75 @@ if save_results and not os.path.exists(output_folder):
     os.makedirs(output_folder)
 
 
-def enforce_bfs_order(graph):
-    start_node = list(graph.nodes())[0]
+def _build_bfs_order(graph, random_root=False, rng=None, deterministic_root=None):
+    nodes = list(graph.nodes())
+    if len(nodes) == 0:
+        return []
+
+    if random_root:
+        if rng is None:
+            rng = np.random.default_rng(42)
+        start_node = nodes[int(rng.integers(0, len(nodes)))]
+    else:
+        start_node = deterministic_root if deterministic_root in graph else min(nodes)
+
     ordered_nodes = list(nx.bfs_tree(graph, start_node).nodes())
+    if len(ordered_nodes) < len(nodes):
+        remaining = [n for n in nodes if n not in set(ordered_nodes)]
+        for root in sorted(remaining):
+            comp_nodes = list(nx.bfs_tree(graph, root).nodes())
+            for n in comp_nodes:
+                if n not in ordered_nodes:
+                    ordered_nodes.append(n)
+    return ordered_nodes
+
+
+def enforce_bfs_order(graph, random_root=False, rng=None, deterministic_root=None):
+    ordered_nodes = _build_bfs_order(
+        graph, random_root=random_root, rng=rng, deterministic_root=deterministic_root
+    )
     mapping = {old_label: new_label for new_label, old_label in enumerate(ordered_nodes)}
     ordered_graph = nx.relabel_nodes(graph, mapping)
     return ordered_graph
     
 
 
+
+
+def _select_generated_neighbors(
+    new_node_features, existing_node_features, generated_norm_edge_weights, normalization_params, f=3.0, kmin=5
+):
+    if existing_node_features.shape[0] == 0:
+        return []
+
+    new_pos = denormalize_data(
+        np.asarray(new_node_features[:3], dtype=np.float32),
+        normalization_params['pos_min'],
+        normalization_params['pos_max'],
+        from_range=(-1, 1),
+    )
+    existing_pos = denormalize_data(
+        np.asarray(existing_node_features[:, :3], dtype=np.float32),
+        normalization_params['pos_min'],
+        normalization_params['pos_max'],
+        from_range=(-1, 1),
+    )
+
+    distances = np.linalg.norm(existing_pos - new_pos[None, :], axis=1)
+    nearest_dist = float(np.min(distances)) if len(distances) > 0 else 0.0
+    adaptive_radius = f * nearest_dist
+    radius_neighbors = np.where(distances <= adaptive_radius)[0].tolist()
+
+    if len(radius_neighbors) < min(kmin, len(distances)):
+        candidate_neighbors = np.argsort(distances)[:min(kmin, len(distances))].tolist()
+    else:
+        candidate_neighbors = radius_neighbors
+
+    selected = []
+    for idx in candidate_neighbors:
+        if idx < len(generated_norm_edge_weights):
+            selected.append((idx, float(generated_norm_edge_weights[idx])))
+    return selected
 
 
 def generate_new_node(graph, node_rnn, edge_rnn, hidden_projection, M, normalization_params, device):
@@ -140,25 +200,17 @@ def generate_new_node(graph, node_rnn, edge_rnn, hidden_projection, M, normaliza
         edge_rnn_y_pred_sampled = edge_mu_pred.view(1).item()
         generated_edge_prefix.append(edge_rnn_y_pred_sampled)
 
-        # Dynamic threshold for edge presence (adaptive based on data)
-        threshold = np.mean(edge_weights[edge_weights > 0]) if np.any(edge_weights > 0) else 0.2
-
-        if edge_rnn_y_pred_sampled > threshold:
-            new_edges.append((new_node_id, k, edge_rnn_y_pred_sampled))
-            new_edges.append((k, new_node_id, edge_rnn_y_pred_sampled))  # Ensure mutual connection
-
-    # Enforce at least one connection to maintain graph connectivity
-    if len(new_edges) == 0 and num_nodes > 0:
-        # Calculate distances from the new node to all existing nodes
-        distances = np.linalg.norm(positions - new_node_features[:3], axis=1)
-        
-        # Get indices of the two closest nodes
-        nearest_nodes = np.argsort(distances)[:2]
-        
-        # Connect the new node to the two closest nodes
-        for nearest_node in nearest_nodes:
-            new_edges.append((new_node_id, nearest_node, threshold))
-            new_edges.append((nearest_node, new_node_id, threshold))
+    selected_neighbors = _select_generated_neighbors(
+        new_node_features=new_node_features,
+        existing_node_features=node_features,
+        generated_norm_edge_weights=generated_edge_prefix,
+        normalization_params=normalization_params,
+        f=3.0,
+        kmin=5,
+    )
+    for nbr_idx, edge_w in selected_neighbors:
+        new_edges.append((new_node_id, nbr_idx, edge_w))
+        new_edges.append((nbr_idx, new_node_id, edge_w))
 
     return new_node_features, new_edges, norm_edge_weights
 
@@ -305,13 +357,23 @@ def denormalize_data(data, min_value, max_value):
 '''
 
 # Modify the generate_similar_graph function to include denormalization
+def _get_seeded_first_node_features(reference_norm_graph, training_first_node_pool, rng_seed=42):
+    if training_first_node_pool:
+        rng = np.random.default_rng(rng_seed)
+        sample_idx = int(rng.integers(0, len(training_first_node_pool)))
+        return training_first_node_pool[sample_idx]
+    first_node = list(reference_norm_graph.nodes())[0]
+    return reference_norm_graph.nodes[first_node]
+
+
 def generate_similar_graph(graph, node_rnn, edge_rnn, hidden_projection, M, normalization_params, device, max_nodes):
     # Normalize the input graph
     norm_graph = normalize_graph(graph, normalization_params)
 
-    # Get the first node's features (after normalization)
-    first_node = list(norm_graph.nodes())[0]  # Assuming the first node in the graph is the starting point
-    first_node_features = norm_graph.nodes[first_node]
+    # Seeded empirical first node source from BFS-ordered training data
+    first_node_features = _get_seeded_first_node_features(
+        norm_graph, TRAINING_FIRST_NODE_POOL, rng_seed=42
+    )
 
     # Create initial graph with just the first node
     new_graph = nx.Graph()
@@ -339,9 +401,10 @@ def generate_and_save(epoch, sample_graph, node_rnn, edge_rnn, hidden_projection
     # Normalize the input graph
     norm_graph = normalize_graph(sample_graph, normalization_params)
 
-    # Get the first node's features (after normalization)
-    first_node = list(norm_graph.nodes())[0]  # Assuming the first node in the graph is the starting point
-    first_node_features = norm_graph.nodes[first_node]
+    # Seeded empirical first node source from BFS-ordered training data
+    first_node_features = _get_seeded_first_node_features(
+        norm_graph, TRAINING_FIRST_NODE_POOL, rng_seed=42 + int(epoch)
+    )
 
     # Create initial graph with just the first node
     new_graph = nx.Graph()
@@ -382,7 +445,7 @@ def generate_and_save(epoch, sample_graph, node_rnn, edge_rnn, hidden_projection
 
 
 # Load subgraphs dataset with enforced BFS ordering
-def load_subgraphs_dataset(filename):
+def load_subgraphs_dataset(filename, mode='train', seed=42):
     data = np.load(filename, allow_pickle=True,mmap_mode='r')
     subgraphs = data['subgraphs']
     adj_matrices = []
@@ -392,10 +455,21 @@ def load_subgraphs_dataset(filename):
     curvatures = []
     edge_weights = []
 
-    for sg in subgraphs:
+    for idx, sg in enumerate(subgraphs):
         adj_matrix = sg['adj_matrix']
         graph = nx.from_numpy_array(adj_matrix)
-        bfs_order = list(nx.bfs_tree(graph, source=0).nodes())
+        if mode == 'train':
+            bfs_order = _build_bfs_order(
+                graph,
+                random_root=True,
+                rng=np.random.default_rng(seed + idx),
+            )
+        else:
+            bfs_order = _build_bfs_order(
+                graph,
+                random_root=False,
+                deterministic_root=min(graph.nodes()) if graph.number_of_nodes() > 0 else None,
+            )
         adj_matrix_bfs = adj_matrix[bfs_order][:, bfs_order]
 
         adj_matrices.append(adj_matrix_bfs)
@@ -555,8 +629,8 @@ def custom_collate_fn(batch):
 
 
 # Load the subgraphs dataset
-adj_matrices, positions_list, scales_list, obb_euler_list, curvatures_list, edge_weights_list = load_subgraphs_dataset('MULTI_train_subgraphs.npz')
-adj_matrices_val, positions_list_val, scales_list_val, obb_euler_list_val, curvatures_list_val, edge_weights_list_val = load_subgraphs_dataset('MULTI_test_subgraphs.npz')
+adj_matrices, positions_list, scales_list, obb_euler_list, curvatures_list, edge_weights_list = load_subgraphs_dataset('MULTI_train_subgraphs.npz', mode='train', seed=42)
+adj_matrices_val, positions_list_val, scales_list_val, obb_euler_list_val, curvatures_list_val, edge_weights_list_val = load_subgraphs_dataset('MULTI_test_subgraphs.npz', mode='val', seed=42)
 
 # Print baseline dataset sizes
 print(f"Full train samples: {len(adj_matrices)}")
@@ -589,6 +663,16 @@ print(f"Using val samples: {len(adj_matrices_val)}")
 train_positions, train_scales, train_obb_euler, train_curvatures, train_edge_weights, normalization_params = normalize_dataset(
     positions_list, scales_list, obb_euler_list, curvatures_list, edge_weights_list
 )
+TRAINING_FIRST_NODE_POOL = [
+    {
+        'centroid': train_positions[i][0],
+        'scale': train_scales[i][0],
+        'obb_euler': train_obb_euler[i][0],
+        'curvature': train_curvatures[i][0],
+    }
+    for i in range(len(train_positions))
+    if len(train_positions[i]) > 0
+]
 
 train_graph_db = GraphDataset(
     adj_matrices, train_positions, train_scales, train_obb_euler, train_curvatures, train_edge_weights, normalization_params
@@ -743,7 +827,7 @@ class CUSTOM_RNN_NODE(nn.Module):
             mu, log_var = raw[..., :dim], raw[..., dim:]
             if mean_act is not None:
                 mu = mean_act(mu)
-            log_var = log_var.clamp(-4, 4)
+            log_var = log_var.clamp(-5, 5)
             return mu, log_var
 
         pos_mu, pos_lv = _split_gaussian(self.position_fc(combined_features), 3, torch.tanh)
@@ -879,7 +963,7 @@ edge_rnn = CUSTOM_RNN_EDGE(
     hidden_size=hidden_size_edge_rnn,
     output_size=1,  # Ensure output_size matches the edge weights dimensions
     number_layers=num_layers,
-    dropout_rate=dropout_rate + 0.1
+    dropout_rate=dropout_rate
 ).to(device)
 
 hidden_projection = nn.Linear(hidden_size_node_rnn, hidden_size_edge_rnn).to(device)
@@ -915,6 +999,9 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
         try:
             graphs, adj_matrices, edge_weights, positions, scales, obb_euler, curvatures, normalization_params = data
             batch_size = len(graphs)
+            num_nodes_per_sample = torch.tensor(
+                [graph.number_of_nodes() for graph in graphs], dtype=torch.long, device=device
+            )
             num_nodes = max([graph.number_of_nodes() for graph in graphs])
             max_seq_len = max(num_nodes - 1, 1)  # Ensure max_seq_len is at least 1
 
@@ -975,11 +1062,17 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
                         edge_lv_high_clamp += (elv_det > 4.5).sum().item()
                         
                         edge_target = edge_weights[:, k, t].view(batch_size, 1).to(device)
+                        valid_mask = (
+                            (k < t)
+                            & (t < num_nodes_per_sample)
+                            & (k < num_nodes_per_sample)
+                        ).float().view(batch_size, 1)
+                        assert edge_target.shape == edge_mu.shape == edge_lv.shape, "Edge tensor shape mismatch"
 
                         # Edge Gaussian NLL (Eq. 16, D=1 so 1/2 is correct)
                         edge_var = edge_lv.exp()
                         edge_nll = 0.5 * (edge_target - edge_mu)**2 / edge_var + 0.5 * edge_lv
-                        edge_loss = edge_loss + edge_nll.mean()
+                        edge_loss = edge_loss + (edge_nll * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
                         var_reg = var_reg + edge_lv.sum()
 
             # Eq. 17: L_total = λ_node * L_node + L_edge + λ_var * Σ log σ²
@@ -1051,6 +1144,9 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
         for data in val_loader:
             graphs, adj_matrices, edge_weights, positions, scales, obb_euler, curvatures, normalization_params = data
             batch_size = len(graphs)
+            num_nodes_per_sample = torch.tensor(
+                [graph.number_of_nodes() for graph in graphs], dtype=torch.long, device=device
+            )
             num_nodes = max([graph.number_of_nodes() for graph in graphs])
             max_seq_len = max(num_nodes - 1, 1)  # Ensure max_seq_len is at least 1
 
@@ -1096,10 +1192,16 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
                     edge_mu = edge_mu.view(batch_size, 1)
                     edge_lv = edge_lv.view(batch_size, 1)
                     edge_target = edge_weights[:, k, t].view(batch_size, 1).to(device)
+                    valid_mask = (
+                        (k < t)
+                        & (t < num_nodes_per_sample)
+                        & (k < num_nodes_per_sample)
+                    ).float().view(batch_size, 1)
+                    assert edge_target.shape == edge_mu.shape == edge_lv.shape, "Edge tensor shape mismatch"
 
                     edge_var = edge_lv.exp()
                     edge_nll = 0.5 * (edge_target - edge_mu)**2 / edge_var + 0.5 * edge_lv
-                    edge_loss = edge_loss + edge_nll.mean()
+                    edge_loss = edge_loss + (edge_nll * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
 
             edge_loss = edge_loss * edge_loss_scale
             node_loss = node_loss * node_loss_scale
@@ -1806,4 +1908,3 @@ ax2 = fig.add_subplot(122, projection='3d')
 plot_graph_3d(new_graph, ax=ax2, title='Generated Graph (Built with GraphRNN)')
 
 plt.show()
-
