@@ -819,8 +819,20 @@ class CUSTOM_RNN_NODE(nn.Module):
         h, h_n = self.rnn(input_concat)
         self.hidden_n = h_n
 
-        # Self-attention
-        attn_output, attn_weights = self.attention(h, h, h)  # (batch_size, seq_length, hidden_size)
+        seq_len = h.size(1)
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=h.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        key_padding_mask = None
+        if seq_lengths is not None:
+            time_idx = torch.arange(seq_len, device=h.device).unsqueeze(0)
+            key_padding_mask = time_idx >= seq_lengths.unsqueeze(1)
+
+        # Self-attention (causal, with optional valid-length masking)
+        attn_output, attn_weights = self.attention(
+            h, h, h, attn_mask=causal_mask, key_padding_mask=key_padding_mask
+        )  # (batch_size, seq_length, hidden_size)
 
         # Residual connection + layer norm
         h = self.ln(attn_output + h)
@@ -913,7 +925,7 @@ class CUSTOM_RNN_EDGE(nn.Module):
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
 
-    def forward(self, input, seq_lengths=None, is_mlp=False):
+    def forward(self, input, seq_lengths=None, is_mlp=False, return_all=False):
         if self.use_embedding:
             # Apply embedding if enabled
             input_embed = self.feature_embedding(input)
@@ -929,6 +941,11 @@ class CUSTOM_RNN_EDGE(nn.Module):
         h = self.dropout(h)
 
         # Gaussian output: mean and log-variance
+        if return_all:
+            mu = self.mean_head(h)
+            log_var = self.logvar_head(h).clamp(-5, 5)
+            return mu, log_var
+
         h_last = h[:, -1, :]
         mu = self.mean_head(h_last)
         log_var = self.logvar_head(h_last).clamp(-5, 5)
@@ -1039,58 +1056,71 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
             var_reg = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
 
             with autocast("cuda"):
-                for t in range(1, max_seq_len):
-                    node_mu, node_lv = node_rnn(x[:, :t, :], node_labels[:, :t], is_packed=False)
-                    target = node_labels[:, t, :]  # (B, D)
-                    mu_t = node_mu[:, t-1, :]      # predicted mean at step t-1
-                    lv_t = node_lv[:, t-1, :]      # predicted log-variance
-                    lv_det = lv_t.detach()
-                    node_lv_sum += lv_det.sum().item()
-                    node_lv_count += lv_det.numel()
-                    node_lv_min = min(node_lv_min, lv_det.min().item())
-                    node_lv_max = max(node_lv_max, lv_det.max().item())
-                    node_lv_low_clamp += (lv_det < -4.5).sum().item()
-                    node_lv_high_clamp += (lv_det > 4.5).sum().item()
-                    
-                    # Gaussian NLL (Eq. 15 corrected: D/2 not 1/2)
-                    var_t = lv_t.exp()
-                    D = mu_t.shape[-1]
-                    nll = 0.5 * ((target - mu_t)**2 / var_t).sum(-1) + 0.5 * D * lv_t.mean(-1)
-                    node_loss = node_loss + nll.mean()
-                    var_reg = var_reg + lv_t.sum()
+                node_mu, node_lv = node_rnn(
+                    x, node_labels, seq_lengths=num_nodes_per_sample, is_packed=False
+                )
 
-                    for k in range(t):
-                        if k == 0:
-                            edge_prefix_x = torch.zeros((batch_size, 1, 1), dtype=torch.float32, device=device)
-                        else:
-                            edge_prefix_x = edge_weights[:, :k, t].unsqueeze(-1).to(device)
-                        edge_mu, edge_lv = edge_rnn(edge_prefix_x)
-                        edge_mu = edge_mu.view(batch_size, 1)
-                        edge_lv = edge_lv.view(batch_size, 1)
-                        elv_det = edge_lv.detach()
+                if max_seq_len > 0:
+                    node_mu_next = node_mu[:, :max_seq_len, :]
+                    node_lv_next = node_lv[:, :max_seq_len, :]
+                    node_target_next = node_labels[:, 1:max_seq_len + 1, :]
+
+                    next_step_valid = (
+                        torch.arange(max_seq_len, device=device).unsqueeze(0)
+                        < (num_nodes_per_sample - 1).unsqueeze(1)
+                    ).float()
+
+                    var_t = node_lv_next.exp()
+                    D = node_mu_next.shape[-1]
+                    node_nll = 0.5 * ((node_target_next - node_mu_next) ** 2 / var_t).sum(-1) + 0.5 * D * node_lv_next.mean(-1)
+                    node_loss = node_loss + (node_nll * next_step_valid).sum() / next_step_valid.sum().clamp_min(1.0)
+                    var_reg = var_reg + (node_lv_next * next_step_valid.unsqueeze(-1)).sum()
+
+                    used_node_lv = node_lv_next[next_step_valid.bool()]
+                    if used_node_lv.numel() > 0:
+                        lv_det = used_node_lv.detach()
+                        node_lv_sum += lv_det.sum().item()
+                        node_lv_count += lv_det.numel()
+                        node_lv_min = min(node_lv_min, lv_det.min().item())
+                        node_lv_max = max(node_lv_max, lv_det.max().item())
+                        node_lv_low_clamp += (lv_det < -4.5).sum().item()
+                        node_lv_high_clamp += (lv_det > 4.5).sum().item()
+
+                    S = max_seq_len
+                    edge_targets = edge_weights[:, :S, 1:S + 1]
+                    edge_prefix_x = torch.zeros((batch_size, S, S, 1), dtype=torch.float32, device=device)
+                    if S > 1:
+                        edge_prefix_x[:, 1:, :, 0] = edge_weights[:, :S - 1, 1:S + 1]
+
+                    edge_input_flat = edge_prefix_x.permute(0, 2, 1, 3).reshape(batch_size * S, S, 1)
+                    edge_mu_all, edge_lv_all = edge_rnn(edge_input_flat, return_all=True)
+                    edge_mu_all = edge_mu_all.view(batch_size, S, S).permute(0, 2, 1)
+                    edge_lv_all = edge_lv_all.view(batch_size, S, S).permute(0, 2, 1)
+
+                    src_idx = torch.arange(S, device=device).view(1, S, 1)
+                    tgt_idx = torch.arange(S, device=device).view(1, 1, S)
+                    lower_tri_valid = src_idx <= tgt_idx
+                    src_valid = src_idx < num_nodes_per_sample.view(batch_size, 1, 1)
+                    tgt_valid = (tgt_idx + 1) < num_nodes_per_sample.view(batch_size, 1, 1)
+                    geo_valid = adaptive_radius_mask[:, :S, 1:S + 1]
+                    edge_valid_mask = (lower_tri_valid & src_valid & tgt_valid & geo_valid).float()
+
+                    edge_var = edge_lv_all.exp()
+                    edge_nll = 0.5 * (edge_targets - edge_mu_all) ** 2 / edge_var + 0.5 * edge_lv_all
+                    valid_count_per_pair = edge_valid_mask.sum(dim=0)
+                    pairwise_edge_loss = (edge_nll * edge_valid_mask).sum(dim=0) / valid_count_per_pair.clamp_min(1.0)
+                    edge_loss = edge_loss + (pairwise_edge_loss * (valid_count_per_pair > 0).float()).sum()
+                    var_reg = var_reg + (edge_lv_all * edge_valid_mask).sum()
+
+                    used_edge_lv = edge_lv_all[edge_valid_mask.bool()]
+                    if used_edge_lv.numel() > 0:
+                        elv_det = used_edge_lv.detach()
                         edge_lv_sum += elv_det.sum().item()
                         edge_lv_count += elv_det.numel()
                         edge_lv_min = min(edge_lv_min, elv_det.min().item())
                         edge_lv_max = max(edge_lv_max, elv_det.max().item())
                         edge_lv_low_clamp += (elv_det < -4.5).sum().item()
                         edge_lv_high_clamp += (elv_det > 4.5).sum().item()
-                        
-                        edge_target = edge_weights[:, k, t].view(batch_size, 1).to(device)
-                        seq_valid_mask = (
-                            (k < t)
-                            & (t < num_nodes_per_sample)
-                            & (k < num_nodes_per_sample)
-                        ).float().view(batch_size, 1)
-                        geo_valid_mask = adaptive_radius_mask[:, k, t].float().view(batch_size, 1)
-                        valid_mask = seq_valid_mask * geo_valid_mask
-                        assert edge_target.shape == edge_mu.shape == edge_lv.shape, "Edge tensor shape mismatch"
-
-                        # Edge Gaussian NLL (Eq. 16, D=1 so 1/2 is correct)
-                        edge_var = edge_lv.exp()
-                        edge_nll = 0.5 * (edge_target - edge_mu)**2 / edge_var + 0.5 * edge_lv
-                        edge_loss = edge_loss + (edge_nll * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
-                        # Keep edge variance regularization aligned with the same valid lower-triangular mask.
-                        var_reg = var_reg + (edge_lv * valid_mask).sum()
 
             # Eq. 17: L_total = λ_node * L_node + L_edge + λ_var * Σ log σ²
             total_loss = node_loss_scale * node_loss + edge_loss_scale * edge_loss + lambda_var * var_reg
@@ -1191,39 +1221,49 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
             node_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
             edge_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
 
-            for t in range(1, max_seq_len):
-                node_mu, node_lv = node_rnn(x[:, :t, :], node_labels[:, :t], is_packed=False)
-                target = node_labels[:, t, :]
-                mu_t = node_mu[:, t-1, :]
-                lv_t = node_lv[:, t-1, :]
+            node_mu, node_lv = node_rnn(
+                x, node_labels, seq_lengths=num_nodes_per_sample, is_packed=False
+            )
 
-                # Gaussian NLL (Eq. 15 corrected)
-                var_t = lv_t.exp()
-                D = mu_t.shape[-1]
-                nll = 0.5 * ((target - mu_t)**2 / var_t).sum(-1) + 0.5 * D * lv_t.mean(-1)
-                node_loss = node_loss + nll.mean()
+            if max_seq_len > 0:
+                node_mu_next = node_mu[:, :max_seq_len, :]
+                node_lv_next = node_lv[:, :max_seq_len, :]
+                node_target_next = node_labels[:, 1:max_seq_len + 1, :]
 
-                for k in range(t):
-                    if k == 0:
-                        edge_prefix_x = torch.zeros((batch_size, 1, 1), dtype=torch.float32, device=device)
-                    else:
-                        edge_prefix_x = edge_weights[:, :k, t].unsqueeze(-1).to(device)
-                    edge_mu, edge_lv = edge_rnn(edge_prefix_x)
-                    edge_mu = edge_mu.view(batch_size, 1)
-                    edge_lv = edge_lv.view(batch_size, 1)
-                    edge_target = edge_weights[:, k, t].view(batch_size, 1).to(device)
-                    seq_valid_mask = (
-                        (k < t)
-                        & (t < num_nodes_per_sample)
-                        & (k < num_nodes_per_sample)
-                    ).float().view(batch_size, 1)
-                    geo_valid_mask = adaptive_radius_mask[:, k, t].float().view(batch_size, 1)
-                    valid_mask = seq_valid_mask * geo_valid_mask
-                    assert edge_target.shape == edge_mu.shape == edge_lv.shape, "Edge tensor shape mismatch"
+                next_step_valid = (
+                    torch.arange(max_seq_len, device=device).unsqueeze(0)
+                    < (num_nodes_per_sample - 1).unsqueeze(1)
+                ).float()
 
-                    edge_var = edge_lv.exp()
-                    edge_nll = 0.5 * (edge_target - edge_mu)**2 / edge_var + 0.5 * edge_lv
-                    edge_loss = edge_loss + (edge_nll * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
+                var_t = node_lv_next.exp()
+                D = node_mu_next.shape[-1]
+                node_nll = 0.5 * ((node_target_next - node_mu_next) ** 2 / var_t).sum(-1) + 0.5 * D * node_lv_next.mean(-1)
+                node_loss = node_loss + (node_nll * next_step_valid).sum() / next_step_valid.sum().clamp_min(1.0)
+
+                S = max_seq_len
+                edge_targets = edge_weights[:, :S, 1:S + 1]
+                edge_prefix_x = torch.zeros((batch_size, S, S, 1), dtype=torch.float32, device=device)
+                if S > 1:
+                    edge_prefix_x[:, 1:, :, 0] = edge_weights[:, :S - 1, 1:S + 1]
+
+                edge_input_flat = edge_prefix_x.permute(0, 2, 1, 3).reshape(batch_size * S, S, 1)
+                edge_mu_all, edge_lv_all = edge_rnn(edge_input_flat, return_all=True)
+                edge_mu_all = edge_mu_all.view(batch_size, S, S).permute(0, 2, 1)
+                edge_lv_all = edge_lv_all.view(batch_size, S, S).permute(0, 2, 1)
+
+                src_idx = torch.arange(S, device=device).view(1, S, 1)
+                tgt_idx = torch.arange(S, device=device).view(1, 1, S)
+                lower_tri_valid = src_idx <= tgt_idx
+                src_valid = src_idx < num_nodes_per_sample.view(batch_size, 1, 1)
+                tgt_valid = (tgt_idx + 1) < num_nodes_per_sample.view(batch_size, 1, 1)
+                geo_valid = adaptive_radius_mask[:, :S, 1:S + 1]
+                edge_valid_mask = (lower_tri_valid & src_valid & tgt_valid & geo_valid).float()
+
+                edge_var = edge_lv_all.exp()
+                edge_nll = 0.5 * (edge_targets - edge_mu_all) ** 2 / edge_var + 0.5 * edge_lv_all
+                valid_count_per_pair = edge_valid_mask.sum(dim=0)
+                pairwise_edge_loss = (edge_nll * edge_valid_mask).sum(dim=0) / valid_count_per_pair.clamp_min(1.0)
+                edge_loss = edge_loss + (pairwise_edge_loss * (valid_count_per_pair > 0).float()).sum()
 
             edge_loss = edge_loss * edge_loss_scale
             node_loss = node_loss * node_loss_scale
