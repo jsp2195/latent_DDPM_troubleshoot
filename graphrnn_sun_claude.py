@@ -69,6 +69,7 @@ else:
 # Load the model
 node_model_path = os.path.join(output_folder, 'node_rnn_final.pth')
 edge_model_path = os.path.join(output_folder, 'edge_rnn_final.pth')
+hidden_projection_model_path = os.path.join(output_folder, 'hidden_projection_final.pth')
 
 
 # Create output directory if it doesn't exist
@@ -1638,6 +1639,8 @@ if os.path.exists(node_model_path) and os.path.exists(edge_model_path) and os.pa
     # Load models
     node_rnn.load_state_dict(torch.load(node_model_path, map_location=torch.device('cpu')))
     edge_rnn.load_state_dict(torch.load(edge_model_path, map_location=torch.device('cpu')))
+    if os.path.exists(hidden_projection_model_path):
+        hidden_projection.load_state_dict(torch.load(hidden_projection_model_path, map_location=torch.device('cpu')))
     
     # Load training state
     checkpoint = torch.load(state_checkpoint_path, map_location=torch.device('cpu'))
@@ -1770,6 +1773,7 @@ for epoch in tqdm(range(start_epoch, epochs)):
         best_loss = val_node_loss
         torch.save(node_rnn.state_dict(), node_model_path)
         torch.save(edge_rnn.state_dict(), edge_model_path)
+        torch.save(hidden_projection.state_dict(), hidden_projection_model_path)
         
         print(f"Current learning rate: Node LR: {scheduler_node.get_last_lr()[0]}, Edge LR: {scheduler_edge.get_last_lr()[0]}")
 
@@ -1832,6 +1836,7 @@ for epoch in tqdm(range(start_epoch, epochs)):
 # Save the final model
 torch.save(node_rnn.state_dict(), os.path.join(output_folder, 'node_rnn_final.pth'))
 torch.save(edge_rnn.state_dict(), os.path.join(output_folder, 'edge_rnn_final.pth'))
+torch.save(hidden_projection.state_dict(), os.path.join(output_folder, 'hidden_projection_final.pth'))
 print("Final model saved.")
 raise SystemExit
 
