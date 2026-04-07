@@ -702,6 +702,8 @@ def make_torch_dataloaders(
 
 
 def train_ddpm(args) -> None:
+    max_train_samples = getattr(args, "max_train_samples", None)
+    max_val_samples = getattr(args, "max_val_samples", None)
     X, Y, lbl_stats, lat_stats = build_ddpm_arrays(
         args.encoded_features,
         args.obb_vectors,
@@ -715,7 +717,7 @@ def train_ddpm(args) -> None:
     ensure_dir(args.ddpm_ckpt_dir)
     train_ds, val_ds = make_torch_dataloaders(
         X, Y, args.batch_size, lat_stats.latent_max, args.val_split, args.seed,
-        max_train_samples=args.max_train_samples, max_val_samples=args.max_val_samples,
+        max_train_samples=max_train_samples, max_val_samples=max_val_samples,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1042,6 +1044,8 @@ def save_ae_epoch_visual(model, fixed_batch, device, out_path: str, fig_count: i
 
 
 def train_ae(args) -> None:
+    max_train_samples = getattr(args, "max_train_samples", None)
+    max_val_samples = getattr(args, "max_val_samples", None)
     ensure_dir(args.ae_ckpt_dir)
     viz_dir = os.path.join(args.ae_ckpt_dir, "epoch_viz")
     ensure_dir(viz_dir)
@@ -1050,8 +1054,8 @@ def train_ae(args) -> None:
         args.ae_batch_size,
         args.val_split,
         args.seed,
-        max_train_samples=args.max_train_samples,
-        max_val_samples=args.max_val_samples,
+        max_train_samples=max_train_samples,
+        max_val_samples=max_val_samples,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1474,6 +1478,8 @@ def build_parser():
     p_all.add_argument("--ae_batch_size", type=int, default=16)
     p_all.add_argument("--ae_epochs", type=int, default=300)
     p_all.add_argument("--ae_lr", type=float, default=1e-4)
+    p_all.add_argument("--max_train_samples", type=int, default=None)
+    p_all.add_argument("--max_val_samples", type=int, default=None)
 
     p_all.add_argument("--max_graphs", type=int, default=116)
     p_all.add_argument("--gen_batch_size", type=int, default=64)
