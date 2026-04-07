@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as tnn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 
 from einops import rearrange
 
@@ -183,10 +184,6 @@ def build_ddpm_arrays(
     obb_path: str,
     scale_path: str,
     curv_path: str,
-    max_train_samples: Optional[int] = None,
-    max_val_samples: Optional[int] = None,
-    val_split: float = 0.2,
-    seed: int = 42,
 ) -> Tuple[np.ndarray, np.ndarray, LabelNormStats, LatentNormStats]:
     ensure_file(encoded_path)
     ensure_file(obb_path)
@@ -203,22 +200,6 @@ def build_ddpm_arrays(
     obb = obb[:n]
     scale = scale[:n]
     curv = curv[:n]
-
-    if max_train_samples is not None or max_val_samples is not None:
-        vt = int(round(val_split * n))
-        tt = n - vt
-
-        train_cap = tt if max_train_samples is None else min(tt, max_train_samples)
-        val_cap = vt if max_val_samples is None else min(vt, max_val_samples)
-
-        total_cap = train_cap + val_cap
-        rng = np.random.default_rng(seed)
-        idx = rng.permutation(n)[:total_cap]
-
-        encoded = encoded[idx]
-        obb = obb[idx]
-        scale = scale[idx]
-        curv = curv[idx]
 
     if encoded.ndim == 3:
         encoded = encoded[..., None]
@@ -688,13 +669,26 @@ class DDPMDataset(Dataset):
         return x, y
 
 
-def make_torch_dataloaders(X: np.ndarray, Y: np.ndarray, batch_size: int, latent_max: float, val_split: float, seed: int):
+def make_torch_dataloaders(
+    X: np.ndarray,
+    Y: np.ndarray,
+    batch_size: int,
+    latent_max: float,
+    val_split: float,
+    seed: int,
+    max_train_samples: Optional[int] = None,
+    max_val_samples: Optional[int] = None,
+):
     n = len(X)
     idx = np.arange(n)
     rng = np.random.default_rng(seed)
     rng.shuffle(idx)
     split = int((1.0 - val_split) * n)
-    tr_idx, va_idx = idx[:split], idx[split:]
+    tr_idx_full, va_idx_full = idx[:split], idx[split:]
+    tr_cap = len(tr_idx_full) if max_train_samples is None else min(len(tr_idx_full), max_train_samples)
+    va_cap = len(va_idx_full) if max_val_samples is None else min(len(va_idx_full), max_val_samples)
+    tr_idx = tr_idx_full[:tr_cap]
+    va_idx = va_idx_full[:va_cap]
 
     Xtr, Ytr = X[tr_idx], Y[tr_idx]
     Xva, Yva = X[va_idx], Y[va_idx]
@@ -713,23 +707,23 @@ def train_ddpm(args) -> None:
         args.obb_vectors,
         args.scale_coeffs,
         args.curvatures,
-        max_train_samples=args.max_train_samples,
-        max_val_samples=args.max_val_samples,
-        val_split=args.val_split,
-        seed=args.seed,
     )
     feature_size = int(X.shape[1])
     if X.shape[1] != X.shape[2]:
         raise ValueError(f"DDPM expects square latent grids, got {X.shape}")
 
     ensure_dir(args.ddpm_ckpt_dir)
-    train_ds, val_ds = make_torch_dataloaders(X, Y, args.batch_size, lat_stats.latent_max, args.val_split, args.seed)
+    train_ds, val_ds = make_torch_dataloaders(
+        X, Y, args.batch_size, lat_stats.latent_max, args.val_split, args.seed,
+        max_train_samples=args.max_train_samples, max_val_samples=args.max_val_samples,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_ddpm_model(feature_size).to(device)
     trainer = DDPMTrainer(model, timesteps=args.timesteps, beta_start=args.beta_start, beta_end=args.beta_end, device=device)
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # NOTE: this decays once per epoch (unlike the previous TF per-step decay); kept unchanged in this pass.
     lr_sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.9)
 
     latest_path = os.path.join(args.ddpm_ckpt_dir, "ddpm_latest.pt")
@@ -826,23 +820,18 @@ def get_pointcloud_loaders(
     arr = np.load(path).astype(np.float32)
 
     n_total = len(arr)
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(n_total)
     n_val_full = int(n_total * val_split)
     n_train_full = n_total - n_val_full
 
-    train_cap = n_train_full if max_train_samples is None else min(n_train_full, max_train_samples)
-    val_cap = n_val_full if max_val_samples is None else min(n_val_full, max_val_samples)
+    train_idx_full = idx[:n_train_full]
+    val_idx_full = idx[n_train_full:]
+    train_cap = len(train_idx_full) if max_train_samples is None else min(len(train_idx_full), max_train_samples)
+    val_cap = len(val_idx_full) if max_val_samples is None else min(len(val_idx_full), max_val_samples)
 
-    total_cap = train_cap + val_cap
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(n_total)[:total_cap]
-    arr = arr[idx]
-
-    ds = PointCloudDataset(arr)
-    n_val = val_cap
-    n_train = train_cap
-
-    gen = torch.Generator().manual_seed(seed)
-    train_ds, val_ds = random_split(ds, [n_train, n_val], generator=gen)
+    train_ds = PointCloudDataset(arr[train_idx_full[:train_cap]])
+    val_ds = PointCloudDataset(arr[val_idx_full[:val_cap]])
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=torch.cuda.is_available())
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=torch.cuda.is_available())
@@ -1010,8 +999,52 @@ def validate_epoch_ae(model, loader, device):
     return float(np.mean(losses)) if losses else float("inf")
 
 
+def save_ae_epoch_visual(model, fixed_batch, device, out_path: str, fig_count: int = 4) -> None:
+    model_was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        batch = fixed_batch.to(device)
+        inp = batch.permute(0, 2, 1).contiguous()
+        latent = model.encoder(inp)
+        recon = model(inp)
+
+    gt_np = batch.detach().cpu().numpy()
+    latent_np = latent.detach().cpu().numpy()
+    recon_np = recon.detach().cpu().numpy()
+
+    n = min(fig_count, gt_np.shape[0])
+    if n <= 0:
+        return
+
+    fig = plt.figure(figsize=(3.2 * n, 8.5))
+    for i in range(n):
+        ax1 = fig.add_subplot(3, n, i + 1, projection="3d")
+        ax1.scatter(gt_np[i, :, 0], gt_np[i, :, 1], gt_np[i, :, 2], s=1)
+        ax1.set_title(f"GT {i}")
+        ax1.axis("off")
+
+        ax2 = fig.add_subplot(3, n, n + i + 1)
+        im = ax2.imshow(latent_np[i], cmap="viridis")
+        ax2.set_title(f"Latent {i}")
+        ax2.axis("off")
+        fig.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+
+        ax3 = fig.add_subplot(3, n, 2 * n + i + 1, projection="3d")
+        ax3.scatter(recon_np[i, :, 0], recon_np[i, :, 1], recon_np[i, :, 2], s=1)
+        ax3.set_title(f"Recon {i}")
+        ax3.axis("off")
+
+    ensure_dir(str(Path(out_path).parent))
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    if model_was_training:
+        model.train()
+
+
 def train_ae(args) -> None:
     ensure_dir(args.ae_ckpt_dir)
+    viz_dir = os.path.join(args.ae_ckpt_dir, "epoch_viz")
+    ensure_dir(viz_dir)
     train_loader, val_loader, point_size = get_pointcloud_loaders(
         args.pointcloud_path,
         args.ae_batch_size,
@@ -1024,6 +1057,7 @@ def train_ae(args) -> None:
 
     model = PointCloudAE(point_size=point_size, latent_size=args.latent_size).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.ae_lr)
+    fixed_val_batch = next(iter(val_loader), None)
 
     start_epoch = 1
     best_val = float("inf")
@@ -1041,6 +1075,13 @@ def train_ae(args) -> None:
         tr = train_epoch_ae(model, train_loader, optimizer, device)
         va = validate_epoch_ae(model, val_loader, device)
         logging.info("AE epoch %d/%d | train=%.6f val=%.6f", epoch, args.ae_epochs, tr, va)
+        if fixed_val_batch is not None:
+            save_ae_epoch_visual(
+                model,
+                fixed_val_batch,
+                device,
+                os.path.join(viz_dir, f"ae_epoch_{epoch:04d}.png"),
+            )
 
         torch.save({"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "best_val": best_val}, latest_path)
 
