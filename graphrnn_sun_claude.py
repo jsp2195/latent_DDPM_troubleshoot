@@ -128,22 +128,11 @@ def _select_generated_neighbors(
         normalization_params['pos_max'],
         from_range=(-1, 1),
     )
-    new_scale = float(denormalize_data(
-        np.asarray(new_node_features[3], dtype=np.float32),
-        normalization_params['scale_min'],
-        normalization_params['scale_max'],
-        from_range=(0, 1),
-    ))
-    existing_scales = denormalize_data(
-        np.asarray(existing_node_features[:, 3], dtype=np.float32),
-        normalization_params['scale_min'],
-        normalization_params['scale_max'],
-        from_range=(0, 1),
-    )
 
     distances = np.linalg.norm(existing_pos - new_pos[None, :], axis=1)
-    adaptive_radii = f * (new_scale + existing_scales)
-    radius_neighbors = np.where(distances <= adaptive_radii)[0].tolist()
+    nearest_dist = float(np.min(distances)) if len(distances) > 0 else 0.0
+    adaptive_radius = f * nearest_dist
+    radius_neighbors = np.where(distances <= adaptive_radius)[0].tolist()
 
     if len(radius_neighbors) < min(kmin, len(distances)):
         candidate_neighbors = np.argsort(distances)[:min(kmin, len(distances))].tolist()
@@ -1083,8 +1072,7 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
                         edge_var = edge_lv.exp()
                         edge_nll = 0.5 * (edge_target - edge_mu)**2 / edge_var + 0.5 * edge_lv
                         edge_loss = edge_loss + (edge_nll * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
-                        # Keep edge variance regularization aligned with the same valid lower-triangular mask.
-                        var_reg = var_reg + (edge_lv * valid_mask).sum()
+                        var_reg = var_reg + edge_lv.sum()
 
             # Eq. 17: L_total = λ_node * L_node + L_edge + λ_var * Σ log σ²
             total_loss = node_loss_scale * node_loss + edge_loss_scale * edge_loss + lambda_var * var_reg
