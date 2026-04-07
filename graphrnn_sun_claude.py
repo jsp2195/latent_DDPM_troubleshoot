@@ -125,13 +125,20 @@ def generate_new_node(graph, node_rnn, edge_rnn, hidden_projection, M, normaliza
 
     new_edges = []
     norm_edge_weights = torch.tensor(edge_weights, dtype=torch.float32).unsqueeze(0).to(device)
+    generated_edge_prefix = []
 
     # Symmetric edge prediction to ensure mutual connectivity
     for k in range(num_nodes):
-        edge_x = norm_edge_weights[:, :, k].unsqueeze(-1).to(device)
-        edge_mu_pred, edge_lv_pred = edge_rnn(edge_x)
+        if k == 0:
+            edge_prefix_x = torch.zeros((1, 1, 1), dtype=torch.float32, device=device)
+        else:
+            edge_prefix_x = torch.tensor(
+                generated_edge_prefix, dtype=torch.float32, device=device
+            ).view(1, k, 1)
 
-        edge_rnn_y_pred_sampled = edge_mu_pred.squeeze().item()
+        edge_mu_pred, edge_lv_pred = edge_rnn(edge_prefix_x)
+        edge_rnn_y_pred_sampled = edge_mu_pred.view(1).item()
+        generated_edge_prefix.append(edge_rnn_y_pred_sampled)
 
         # Dynamic threshold for edge presence (adaptive based on data)
         threshold = np.mean(edge_weights[edge_weights > 0]) if np.any(edge_weights > 0) else 0.2
@@ -952,8 +959,11 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
                     edge_rnn.hidden_n = hidden_projection(hidden_states_concat)
 
                     for k in range(t):
-                        edge_x = edge_weights[:, k, t].view(batch_size, 1, 1).to(device)
-                        edge_mu, edge_lv = edge_rnn(edge_x)
+                        if k == 0:
+                            edge_prefix_x = torch.zeros((batch_size, 1, 1), dtype=torch.float32, device=device)
+                        else:
+                            edge_prefix_x = edge_weights[:, :k, t].unsqueeze(-1).to(device)
+                        edge_mu, edge_lv = edge_rnn(edge_prefix_x)
                         edge_mu = edge_mu.view(batch_size, 1)
                         edge_lv = edge_lv.view(batch_size, 1)
                         elv_det = edge_lv.detach()
@@ -1078,8 +1088,11 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
                 edge_rnn.hidden_n = hidden_projection(hidden_states_concat)
 
                 for k in range(t):
-                    edge_x = edge_weights[:, k, t].view(batch_size, 1, 1).to(device)
-                    edge_mu, edge_lv = edge_rnn(edge_x)
+                    if k == 0:
+                        edge_prefix_x = torch.zeros((batch_size, 1, 1), dtype=torch.float32, device=device)
+                    else:
+                        edge_prefix_x = edge_weights[:, :k, t].unsqueeze(-1).to(device)
+                    edge_mu, edge_lv = edge_rnn(edge_prefix_x)
                     edge_mu = edge_mu.view(batch_size, 1)
                     edge_lv = edge_lv.view(batch_size, 1)
                     edge_target = edge_weights[:, k, t].view(batch_size, 1).to(device)
@@ -1300,13 +1313,14 @@ for epoch in tqdm(range(start_epoch, epochs)):
             plt.show()
 
     # Generate and save graphs at regular intervals
-    if epoch % 1 == 0 and save_results:
+    if epoch % 10 == 0 and save_results:
         generate_and_save(epoch, sample_graph, node_rnn, edge_rnn, hidden_projection, M, normalization_params, output_folder, device)
 
 # Save the final model
 torch.save(node_rnn.state_dict(), os.path.join(output_folder, 'node_rnn_final.pth'))
 torch.save(edge_rnn.state_dict(), os.path.join(output_folder, 'edge_rnn_final.pth'))
 print("Final model saved.")
+raise SystemExit
 
 
 
@@ -1792,5 +1806,4 @@ ax2 = fig.add_subplot(122, projection='3d')
 plot_graph_3d(new_graph, ax=ax2, title='Generated Graph (Built with GraphRNN)')
 
 plt.show()
-
 
