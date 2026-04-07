@@ -611,28 +611,27 @@ class GraphDataset(Dataset):
 
     def __getitem__(self, idx):
         adj_matrix = self.adj_matrices[idx]
-        positions = self.positions[idx]
-        scales = self.scales[idx]
-        obb_euler = self.obb_euler[idx]
-        curvatures = self.curvatures[idx]
-        edge_weights = self.edge_weights[idx]
-        graph = create_graph_from_adj_matrix(adj_matrix, positions, scales, obb_euler, curvatures, edge_weights)
-        return graph, adj_matrix, edge_weights, positions, scales, obb_euler, curvatures, self.normalization_params
+        edge_weights = torch.from_numpy(np.asarray(self.edge_weights[idx], dtype=np.float32))
+        positions = torch.from_numpy(np.asarray(self.positions[idx], dtype=np.float32))
+        scales = torch.from_numpy(np.asarray(self.scales[idx], dtype=np.float32))
+        obb_euler = torch.from_numpy(np.asarray(self.obb_euler[idx], dtype=np.float32))
+        curvatures = torch.from_numpy(np.asarray(self.curvatures[idx], dtype=np.float32))
+        num_nodes = torch.tensor(positions.shape[0], dtype=torch.int64)
+        return adj_matrix, edge_weights, positions, scales, obb_euler, curvatures, self.normalization_params, num_nodes
 
 
 
 def custom_collate_fn(batch):
-    graphs, adj_matrices, edge_weights, positions, scales, obb_euler, curvatures, normalization_params = zip(*batch)
-    
-    # Verify BFS order
-    for graph in graphs:
-        nodes_bfs = list(nx.bfs_tree(graph, list(graph.nodes())[0]).nodes())
-        if list(graph.nodes()) != nodes_bfs:
-            print("Expected BFS order:", nodes_bfs)
-            print("Actual order:", list(graph.nodes()))
-            raise ValueError("Nodes are not in BFS order!!!!!!!!!")
-    
-    return list(graphs), np.array(adj_matrices), np.array(edge_weights), np.array(positions), np.array(scales), np.array(obb_euler), np.array(curvatures), normalization_params[0]
+    _, edge_weights, positions, scales, obb_euler, curvatures, normalization_params, num_nodes = zip(*batch)
+    return (
+        torch.stack(edge_weights, dim=0),
+        torch.stack(positions, dim=0),
+        torch.stack(scales, dim=0),
+        torch.stack(obb_euler, dim=0),
+        torch.stack(curvatures, dim=0),
+        normalization_params[0],
+        torch.stack(num_nodes, dim=0),
+    )
 
 
 
@@ -689,7 +688,7 @@ train_graph_db = GraphDataset(
     adj_matrices, train_positions, train_scales, train_obb_euler, train_curvatures, train_edge_weights, normalization_params
 )
 train_loader = DataLoader(
-    train_graph_db, batch_size=1, shuffle=True, collate_fn=custom_collate_fn, num_workers=4, pin_memory=True
+    train_graph_db, batch_size=1, shuffle=True, collate_fn=custom_collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
 )
 
 val_positions, val_scales, val_obb_euler, val_curvatures, val_edge_weights, normalization_params_val = normalize_dataset(
@@ -700,7 +699,7 @@ val_graph_db = GraphDataset(
     adj_matrices_val, val_positions, val_scales, val_obb_euler, val_curvatures, val_edge_weights, normalization_params_val
 )
 val_loader = DataLoader(
-    val_graph_db, batch_size=1, shuffle=False, collate_fn=custom_collate_fn, num_workers=4, pin_memory=True
+    val_graph_db, batch_size=1, shuffle=False, collate_fn=custom_collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
 )
 
 def create_graph_from_adj_matrix(adj_matrix, positions, scales, obb_euler, curvatures, edge_weights):
@@ -1009,19 +1008,17 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
 
     for i, data in enumerate(train_loader):
         try:
-            graphs, adj_matrices, edge_weights, positions, scales, obb_euler, curvatures, normalization_params = data
-            batch_size = len(graphs)
-            num_nodes_per_sample = torch.tensor(
-                [graph.number_of_nodes() for graph in graphs], dtype=torch.long, device=device
-            )
-            num_nodes = max([graph.number_of_nodes() for graph in graphs])
+            edge_weights, positions, scales, obb_euler, curvatures, normalization_params, num_nodes_per_sample = data
+            batch_size = positions.size(0)
+            num_nodes_per_sample = num_nodes_per_sample.to(device, non_blocking=True)
+            num_nodes = int(num_nodes_per_sample.max().item())
             max_seq_len = max(num_nodes - 1, 1)  # Ensure max_seq_len is at least 1
 
-            positions = torch.tensor(positions, dtype=torch.float32, device=device)
-            scales = torch.tensor(scales, dtype=torch.float32, device=device).unsqueeze(-1)
-            obb_euler = torch.tensor(obb_euler, dtype=torch.float32, device=device)
-            curvatures = torch.tensor(curvatures, dtype=torch.float32, device=device).unsqueeze(-1)
-            edge_weights = torch.tensor(edge_weights, dtype=torch.float32, device=device)
+            positions = positions.to(device, non_blocking=True)
+            scales = scales.to(device, non_blocking=True).unsqueeze(-1)
+            obb_euler = obb_euler.to(device, non_blocking=True)
+            curvatures = curvatures.to(device, non_blocking=True).unsqueeze(-1)
+            edge_weights = edge_weights.to(device, non_blocking=True)
 
             x = torch.cat((positions, scales, obb_euler, curvatures), dim=-1).to(device)
             node_labels = x.clone()
@@ -1061,9 +1058,6 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
                     nll = 0.5 * ((target - mu_t)**2 / var_t).sum(-1) + 0.5 * D * lv_t.mean(-1)
                     node_loss = node_loss + nll.mean()
                     var_reg = var_reg + lv_t.sum()
-
-                    hidden_states_concat = node_rnn.hidden_n
-                    edge_rnn.hidden_n = hidden_projection(hidden_states_concat)
 
                     for k in range(t):
                         if k == 0:
@@ -1165,20 +1159,18 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
 
     with torch.no_grad():  # Disable gradient computation during validation
         for data in val_loader:
-            graphs, adj_matrices, edge_weights, positions, scales, obb_euler, curvatures, normalization_params = data
-            batch_size = len(graphs)
-            num_nodes_per_sample = torch.tensor(
-                [graph.number_of_nodes() for graph in graphs], dtype=torch.long, device=device
-            )
-            num_nodes = max([graph.number_of_nodes() for graph in graphs])
+            edge_weights, positions, scales, obb_euler, curvatures, normalization_params, num_nodes_per_sample = data
+            batch_size = positions.size(0)
+            num_nodes_per_sample = num_nodes_per_sample.to(device, non_blocking=True)
+            num_nodes = int(num_nodes_per_sample.max().item())
             max_seq_len = max(num_nodes - 1, 1)  # Ensure max_seq_len is at least 1
 
             # Combine node features into a single tensor
-            positions = torch.tensor(positions, dtype=torch.float32, device=device)
-            scales = torch.tensor(scales, dtype=torch.float32, device=device).unsqueeze(-1)
-            obb_euler = torch.tensor(obb_euler, dtype=torch.float32, device=device)
-            curvatures = torch.tensor(curvatures, dtype=torch.float32, device=device).unsqueeze(-1)
-            edge_weights = torch.tensor(edge_weights, dtype=torch.float32, device=device)
+            positions = positions.to(device, non_blocking=True)
+            scales = scales.to(device, non_blocking=True).unsqueeze(-1)
+            obb_euler = obb_euler.to(device, non_blocking=True)
+            curvatures = curvatures.to(device, non_blocking=True).unsqueeze(-1)
+            edge_weights = edge_weights.to(device, non_blocking=True)
 
             x = torch.cat((positions, scales, obb_euler, curvatures), dim=-1).to(device)
             node_labels = x.clone()
@@ -1210,9 +1202,6 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
                 D = mu_t.shape[-1]
                 nll = 0.5 * ((target - mu_t)**2 / var_t).sum(-1) + 0.5 * D * lv_t.mean(-1)
                 node_loss = node_loss + nll.mean()
-
-                hidden_states_concat = node_rnn.hidden_n
-                edge_rnn.hidden_n = hidden_projection(hidden_states_concat)
 
                 for k in range(t):
                     if k == 0:
