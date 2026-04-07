@@ -30,6 +30,7 @@ node_loss_scale = 5.0      # Paper Eq. 17: λ_node = 5.0
 lambda_var = 0.001         # Paper Eq. 17: variance regularization
 HEAD = 4
 ACCU = 4
+EDGE_ACCEPTANCE_THRESHOLD = 0.5
 M = 14  # 3 pos + 1 scale + 6 sin/cos Euler + 3 OBB dims + 1 curvature
 hidden_size_node_rnn = 256     # Paper Sec 3.2: 256 hidden units
 hidden_size_edge_rnn = 64
@@ -154,7 +155,41 @@ def _select_generated_neighbors(
     return [idx for idx in candidate_neighbors if idx < len(generated_norm_edge_weights)]
 
 
-def generate_new_node(graph, node_rnn, edge_rnn, hidden_projection, M, normalization_params, device):
+def _sample_gaussian(mu, log_var, temperature=1.0):
+    temperature = float(max(temperature, 1e-6))
+    std = torch.exp(0.5 * log_var) * temperature
+    eps = torch.randn_like(std)
+    return mu + eps * std
+
+
+def _clamp_node_feature_ranges(node_tensor):
+    node_tensor = node_tensor.clone()
+    node_tensor[..., 0:3] = node_tensor[..., 0:3].clamp(-1.0, 1.0)   # xyz
+    node_tensor[..., 3:4] = node_tensor[..., 3:4].clamp(0.0, 1.0)    # scale
+    node_tensor[..., 4:10] = node_tensor[..., 4:10].clamp(-1.0, 1.0) # sin/cos
+    node_tensor[..., 10:13] = node_tensor[..., 10:13].clamp(0.0, 1.0) # obb dims
+    node_tensor[..., 13:14] = node_tensor[..., 13:14].clamp(0.0, 1.0) # curvature
+
+    sin_block = node_tensor[..., 4:7]
+    cos_block = node_tensor[..., 7:10]
+    norm = torch.sqrt((sin_block ** 2 + cos_block ** 2).clamp_min(1e-8))
+    node_tensor[..., 4:7] = sin_block / norm
+    node_tensor[..., 7:10] = cos_block / norm
+    return node_tensor
+
+
+def generate_new_node(
+    graph,
+    node_rnn,
+    edge_rnn,
+    hidden_projection,
+    M,
+    normalization_params,
+    device,
+    temperature=1.0,
+    edge_threshold=None,
+    debug_rollout=False,
+):
     num_nodes = graph.number_of_nodes()
     new_node_id = num_nodes
 
@@ -183,13 +218,15 @@ def generate_new_node(graph, node_rnn, edge_rnn, hidden_projection, M, normaliza
     node_rnn.hidden_n = node_rnn.init_hidden(batch_size=1, device=device)
 
     # Forward pass through node RNN (now returns mean, log_var)
-    node_mu, node_lv = node_rnn(node_x, node_x_label, is_packed=False)
+    node_mu, node_lv, node_context = node_rnn(
+        node_x, node_x_label, is_packed=False, return_hidden_features=True
+    )
+    sampled_node = _sample_gaussian(node_mu[:, -1, :], node_lv[:, -1, :], temperature=temperature)
+    sampled_node = _clamp_node_feature_ranges(sampled_node)
+    new_node_features = sampled_node.detach().cpu().numpy().flatten()
 
-    # Use the predicted mean as the new node features (sample from Gaussian if desired)
-    new_node_features = node_mu[:, -1, :].detach().cpu().numpy().flatten()
-
-    # Set the hidden state for the edge RNN based on the node RNN's output
-    edge_rnn.hidden_n = hidden_projection(node_rnn.hidden_n)
+    node_ctx = node_context[:, -1, :]
+    edge_h0 = hidden_projection(node_ctx).unsqueeze(0).contiguous()
 
     new_edges = []
     norm_edge_weights = torch.tensor(edge_weights, dtype=torch.float32).unsqueeze(0).to(device)
@@ -204,8 +241,11 @@ def generate_new_node(graph, node_rnn, edge_rnn, hidden_projection, M, normaliza
                 generated_edge_prefix, dtype=torch.float32, device=device
             ).view(1, k, 1)
 
-        edge_mu_pred, edge_lv_pred = edge_rnn(edge_prefix_x)
-        edge_rnn_y_pred_sampled = edge_mu_pred.view(1).item()
+        edge_mu_pred, edge_lv_pred = edge_rnn(edge_prefix_x, h0=edge_h0)
+        sampled_edge = _sample_gaussian(
+            edge_mu_pred.view(1), edge_lv_pred.view(1), temperature=temperature
+        ).clamp(0.0, 1.0)
+        edge_rnn_y_pred_sampled = sampled_edge.item()
         generated_edge_prefix.append(edge_rnn_y_pred_sampled)
 
     candidate_neighbors = _select_generated_neighbors(
@@ -216,13 +256,31 @@ def generate_new_node(graph, node_rnn, edge_rnn, hidden_projection, M, normaliza
         f=3.0,
         kmin=5,
     )
-    edge_threshold = 0.5
+    used_threshold = float(EDGE_ACCEPTANCE_THRESHOLD if edge_threshold is None else edge_threshold)
+    accepted_neighbor_indices = []
     for nbr_idx in candidate_neighbors:
         edge_w = float(generated_edge_prefix[nbr_idx])
-        if edge_w < edge_threshold:
+        if edge_w < used_threshold:
             continue
+        accepted_neighbor_indices.append(nbr_idx)
         new_edges.append((new_node_id, nbr_idx, edge_w))
         new_edges.append((nbr_idx, new_node_id, edge_w))
+
+    if len(candidate_neighbors) > 0 and len(accepted_neighbor_indices) == 0:
+        best_nbr = max(candidate_neighbors, key=lambda idx: float(generated_edge_prefix[idx]))
+        best_w = float(generated_edge_prefix[best_nbr])
+        new_edges.append((new_node_id, best_nbr, best_w))
+        new_edges.append((best_nbr, new_node_id, best_w))
+        accepted_neighbor_indices = [best_nbr]
+
+    if debug_rollout and len(candidate_neighbors) > 0:
+        sampled_vals = np.asarray([generated_edge_prefix[idx] for idx in candidate_neighbors], dtype=np.float32)
+        print(
+            "[rollout-debug] sampled edge weights pre-threshold "
+            f"mean/std/min/max={sampled_vals.mean():.4f}/{sampled_vals.std():.4f}/"
+            f"{sampled_vals.min():.4f}/{sampled_vals.max():.4f}, "
+            f"candidate_neighbors={len(candidate_neighbors)}, accepted_edges={len(accepted_neighbor_indices)}"
+        )
 
     return new_node_features, new_edges, norm_edge_weights
 
@@ -397,7 +455,8 @@ def generate_similar_graph(graph, node_rnn, edge_rnn, hidden_projection, M, norm
     while new_graph.number_of_nodes() < max_nodes:
         # Generate new node and edges based on the current state of the graph
         new_node_features, new_edges, norm_edge_weights = generate_new_node(
-            new_graph, node_rnn, edge_rnn, hidden_projection, M, normalization_params, device
+            new_graph, node_rnn, edge_rnn, hidden_projection, M, normalization_params, device,
+            temperature=1.0, edge_threshold=EDGE_ACCEPTANCE_THRESHOLD
         )
         new_graph = add_node_to_graph(new_graph, new_node_features, new_edges)
 
@@ -433,7 +492,8 @@ def generate_and_save(epoch, sample_graph, node_rnn, edge_rnn, hidden_projection
     while current_graph.number_of_nodes() < max_nodes:
         # Generate the next node and edges based on the current state of the graph
         new_node_features, new_edges, norm_edge_weights = generate_new_node(
-            current_graph, node_rnn, edge_rnn, hidden_projection, M, normalization_params, device
+            current_graph, node_rnn, edge_rnn, hidden_projection, M, normalization_params, device,
+            temperature=1.0, edge_threshold=EDGE_ACCEPTANCE_THRESHOLD
         )
         current_graph = add_node_to_graph(current_graph, new_node_features, new_edges)
 
@@ -763,6 +823,23 @@ TRAINING_FIRST_NODE_POOL = [
     if len(train_positions[i]) > 0
 ]
 
+def _compute_edge_acceptance_threshold(edge_weight_list, quantile=0.35, default=0.5):
+    positives = []
+    for w in edge_weight_list:
+        if w is None:
+            continue
+        w_arr = np.asarray(w)
+        positives.append(w_arr[w_arr > 0.0])
+    if not positives:
+        return float(default)
+    positives = np.concatenate(positives, axis=0)
+    if positives.size == 0:
+        return float(default)
+    return float(np.clip(np.quantile(positives, quantile), 0.05, 0.95))
+
+EDGE_ACCEPTANCE_THRESHOLD = _compute_edge_acceptance_threshold(train_edge_weights, quantile=0.35, default=0.5)
+print(f"Edge acceptance threshold (from training positives): {EDGE_ACCEPTANCE_THRESHOLD:.4f}")
+
 train_graph_db = GraphDataset(
     adj_matrices, train_positions, train_scales, train_obb_euler, train_curvatures, train_edge_weights, normalization_params
 )
@@ -906,7 +983,15 @@ class CUSTOM_RNN_NODE(nn.Module):
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
 
-    def forward(self, input, x_node_label=None, seq_lengths=None, is_packed=True, is_MLP=False):
+    def forward(
+        self,
+        input,
+        x_node_label=None,
+        seq_lengths=None,
+        is_packed=True,
+        is_MLP=False,
+        return_hidden_features=False,
+    ):
         # Embed input features
         input_embed = self.feature_embedding(input)  # (batch_size, seq_length, embedding_size)
         input_embed = F.relu(input_embed)
@@ -975,6 +1060,8 @@ class CUSTOM_RNN_NODE(nn.Module):
         mean = torch.cat([pos_mu, scl_mu, ang_mu, dim_mu, cur_mu], dim=-1)   # (B, T, 14)
         log_var = torch.cat([pos_lv, scl_lv, ang_lv, dim_lv, cur_lv], dim=-1)  # (B, T, 14)
 
+        if return_hidden_features:
+            return mean, log_var, combined_features
         return mean, log_var
     def init_hidden(self, batch_size, device):
         return torch.zeros(self.number_layers, batch_size, self.hidden_size).to(device)
@@ -1038,7 +1125,7 @@ class CUSTOM_RNN_EDGE(nn.Module):
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
 
-    def forward(self, input, seq_lengths=None, is_mlp=False, return_all=False):
+    def forward(self, input, seq_lengths=None, is_mlp=False, return_all=False, h0=None):
         if self.use_embedding:
             # Apply embedding if enabled
             input_embed = self.feature_embedding(input)
@@ -1048,7 +1135,10 @@ class CUSTOM_RNN_EDGE(nn.Module):
             input_concat = input  # Skip embedding, pass raw input
 
         # Forward pass through GRU
-        h, _ = self.rnn(input_concat)  # h shape: (batch_size, seq_length, hidden_size)
+        if h0 is None:
+            h, _ = self.rnn(input_concat)  # h shape: (batch_size, seq_length, hidden_size)
+        else:
+            h, _ = self.rnn(input_concat, h0)
 
         # Apply dropout
         h = self.dropout(h)
@@ -1172,8 +1262,8 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
             var_reg = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
 
             with autocast("cuda"):
-                node_mu, node_lv = node_rnn(
-                    x, node_labels, seq_lengths=num_nodes_per_sample
+                node_mu, node_lv, node_ctx = node_rnn(
+                    x, node_labels, seq_lengths=num_nodes_per_sample, return_hidden_features=True
                 )
 
                 if max_seq_len > 0:
@@ -1190,7 +1280,8 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
                     D = node_mu_next.shape[-1]
                     node_nll = 0.5 * ((node_target_next - node_mu_next) ** 2 / var_t).sum(-1) + 0.5 * D * node_lv_next.mean(-1)
                     node_loss = node_loss + (node_nll * next_step_valid).sum() / next_step_valid.sum().clamp_min(1.0)
-                    var_reg = var_reg + (node_lv_next * next_step_valid.unsqueeze(-1)).sum()
+                    node_valid_count = next_step_valid.sum().clamp_min(1.0)
+                    var_reg = var_reg + (node_lv_next * next_step_valid.unsqueeze(-1)).sum() / node_valid_count
 
                     used_node_lv = node_lv_next[next_step_valid.bool()]
                     if used_node_lv.numel() > 0:
@@ -1209,7 +1300,11 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
                         edge_prefix_x[:, 1:, :, 0] = edge_weights[:, :S - 1, 1:S + 1]
 
                     edge_input_flat = edge_prefix_x.permute(0, 2, 1, 3).reshape(batch_size * S, S, 1)
-                    edge_mu_all, edge_lv_all = edge_rnn(edge_input_flat, return_all=True)
+                    node_ctx_for_targets = node_ctx[:, :S, :]
+                    projected_ctx = hidden_projection(node_ctx_for_targets)  # [B, S, Hedge]
+                    edge_h0 = projected_ctx.permute(0, 1, 2).reshape(batch_size * S, hidden_size_edge_rnn)
+                    edge_h0 = edge_h0.unsqueeze(0).repeat(edge_rnn.number_layers, 1, 1).contiguous()
+                    edge_mu_all, edge_lv_all = edge_rnn(edge_input_flat, return_all=True, h0=edge_h0)
                     edge_mu_all = edge_mu_all.view(batch_size, S, S).permute(0, 2, 1)
                     edge_lv_all = edge_lv_all.view(batch_size, S, S).permute(0, 2, 1)
 
@@ -1223,10 +1318,9 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
 
                     edge_var = edge_lv_all.exp()
                     edge_nll = 0.5 * (edge_targets - edge_mu_all) ** 2 / edge_var + 0.5 * edge_lv_all
-                    valid_count_per_pair = edge_valid_mask.sum(dim=0)
-                    pairwise_edge_loss = (edge_nll * edge_valid_mask).sum(dim=0) / valid_count_per_pair.clamp_min(1.0)
-                    edge_loss = edge_loss + (pairwise_edge_loss * (valid_count_per_pair > 0).float()).sum()
-                    var_reg = var_reg + (edge_lv_all * edge_valid_mask).sum()
+                    total_valid_edges = edge_valid_mask.sum().clamp_min(1.0)
+                    edge_loss = edge_loss + (edge_nll * edge_valid_mask).sum() / total_valid_edges
+                    var_reg = var_reg + (edge_lv_all * edge_valid_mask).sum() / total_valid_edges
 
                     used_edge_lv = edge_lv_all[edge_valid_mask.bool()]
                     if used_edge_lv.numel() > 0:
@@ -1340,8 +1434,8 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
             node_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
             edge_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
 
-            node_mu, node_lv = node_rnn(
-                x, node_labels, seq_lengths=num_nodes_per_sample
+            node_mu, node_lv, node_ctx = node_rnn(
+                x, node_labels, seq_lengths=num_nodes_per_sample, return_hidden_features=True
             )
 
             if max_seq_len > 0:
@@ -1366,7 +1460,11 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
                     edge_prefix_x[:, 1:, :, 0] = edge_weights[:, :S - 1, 1:S + 1]
 
                 edge_input_flat = edge_prefix_x.permute(0, 2, 1, 3).reshape(batch_size * S, S, 1)
-                edge_mu_all, edge_lv_all = edge_rnn(edge_input_flat, return_all=True)
+                node_ctx_for_targets = node_ctx[:, :S, :]
+                projected_ctx = hidden_projection(node_ctx_for_targets)  # [B, S, Hedge]
+                edge_h0 = projected_ctx.permute(0, 1, 2).reshape(batch_size * S, hidden_size_edge_rnn)
+                edge_h0 = edge_h0.unsqueeze(0).repeat(edge_rnn.number_layers, 1, 1).contiguous()
+                edge_mu_all, edge_lv_all = edge_rnn(edge_input_flat, return_all=True, h0=edge_h0)
                 edge_mu_all = edge_mu_all.view(batch_size, S, S).permute(0, 2, 1)
                 edge_lv_all = edge_lv_all.view(batch_size, S, S).permute(0, 2, 1)
 
@@ -1380,9 +1478,8 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
 
                 edge_var = edge_lv_all.exp()
                 edge_nll = 0.5 * (edge_targets - edge_mu_all) ** 2 / edge_var + 0.5 * edge_lv_all
-                valid_count_per_pair = edge_valid_mask.sum(dim=0)
-                pairwise_edge_loss = (edge_nll * edge_valid_mask).sum(dim=0) / valid_count_per_pair.clamp_min(1.0)
-                edge_loss = edge_loss + (pairwise_edge_loss * (valid_count_per_pair > 0).float()).sum()
+                total_valid_edges = edge_valid_mask.sum().clamp_min(1.0)
+                edge_loss = edge_loss + (edge_nll * edge_valid_mask).sum() / total_valid_edges
 
             edge_loss = edge_loss * edge_loss_scale
             node_loss = node_loss * node_loss_scale
@@ -1394,6 +1491,99 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
     avg_edge_loss_value = total_edge_loss_value / len(val_loader)
 
     return avg_node_loss_value, avg_edge_loss_value
+
+
+def _graph_rollout_metrics(graph):
+    n_nodes = graph.number_of_nodes()
+    n_edges = graph.number_of_edges()
+    mean_degree = (2.0 * n_edges / max(n_nodes, 1)) if n_nodes > 0 else 0.0
+    connected_components = nx.number_connected_components(graph) if n_nodes > 0 else 0
+    if n_nodes > 0:
+        xyz = np.asarray([graph.nodes[n]['centroid'] for n in graph.nodes()], dtype=np.float32)
+        xyz_spread = float(np.std(xyz))
+    else:
+        xyz_spread = 0.0
+    return {
+        "node_count": float(n_nodes),
+        "edge_count": float(n_edges),
+        "mean_degree": float(mean_degree),
+        "connected_components": float(connected_components),
+        "xyz_spread": float(xyz_spread),
+    }
+
+
+def evaluate_rollout_subset(
+    node_rnn,
+    edge_rnn,
+    hidden_projection,
+    normalization_params,
+    device,
+    subset_size=6,
+    epoch=0,
+    temperature=1.0,
+    edge_threshold=0.5,
+):
+    count = min(subset_size, len(adj_matrices_val))
+    metric_keys = ["node_count", "edge_count", "mean_degree", "connected_components", "xyz_spread"]
+    agg_abs_err = {k: 0.0 for k in metric_keys}
+    printed_debug = False
+
+    for i in range(count):
+        ref_graph = create_graph_from_adj_matrix(
+            adj_matrices_val[i],
+            positions_list_val[i],
+            scales_list_val[i],
+            obb_euler_list_val[i],
+            curvatures_list_val[i],
+            edge_weights_list_val[i],
+        )
+        ref_norm = normalize_graph(ref_graph.copy(), normalization_params)
+        max_nodes = ref_graph.number_of_nodes()
+
+        first_node_features = _get_seeded_first_node_features(
+            ref_norm, TRAINING_FIRST_NODE_POOL, rng_seed=42 + int(epoch) + i
+        )
+        generated_graph = nx.Graph()
+        generated_graph.add_node(
+            0,
+            centroid=first_node_features['centroid'],
+            scale=first_node_features['scale'],
+            obb_euler=first_node_features['obb_euler'],
+            curvature=first_node_features['curvature'],
+        )
+
+        while generated_graph.number_of_nodes() < max_nodes:
+            new_node_features, new_edges, _ = generate_new_node(
+                generated_graph,
+                node_rnn,
+                edge_rnn,
+                hidden_projection,
+                M,
+                normalization_params,
+                device,
+                temperature=temperature,
+                edge_threshold=edge_threshold,
+                debug_rollout=(not printed_debug),
+            )
+            printed_debug = True
+            generated_graph = add_node_to_graph(generated_graph, new_node_features, new_edges)
+
+        ref_metrics = _graph_rollout_metrics(ref_norm)
+        gen_metrics = _graph_rollout_metrics(generated_graph)
+        for k in metric_keys:
+            agg_abs_err[k] += abs(gen_metrics[k] - ref_metrics[k])
+
+    if count > 0:
+        for k in metric_keys:
+            agg_abs_err[k] /= float(count)
+    rollout_score = sum(agg_abs_err.values())
+
+    print(
+        "[rollout] "
+        + ", ".join([f"{k}_mae={agg_abs_err[k]:.4f}" for k in metric_keys])
+        + f", score={rollout_score:.4f}"
+    )
+    return agg_abs_err, rollout_score
 
 
 
@@ -1430,6 +1620,7 @@ def clear_memory():
 # Training loop update
 # Define paths for saving and loading training states
 state_checkpoint_path = os.path.join(output_folder, "training_state.pth")
+best_rollout_model_path = os.path.join(output_folder, "best_rollout_models.pth")
 
 optimizer_node = optim.AdamW(
     list(node_rnn.parameters()),
@@ -1457,6 +1648,7 @@ if os.path.exists(node_model_path) and os.path.exists(edge_model_path) and os.pa
     scheduler_node.load_state_dict(checkpoint['scheduler_node_state'])
     scheduler_edge.load_state_dict(checkpoint['scheduler_edge_state'])
     best_loss = checkpoint['best_loss']
+    best_rollout_score = checkpoint.get('best_rollout_score', np.inf)
     patience_counter = checkpoint['patience_counter']
     train_losses = checkpoint['train_losses']
     val_losses = checkpoint['val_losses']
@@ -1466,6 +1658,7 @@ else:
 
 
     best_loss = np.inf
+    best_rollout_score = np.inf
     patience_counter = 0
     train_losses = {'node': [], 'edge': []}
     val_losses = {'node': [], 'edge': []}
@@ -1473,6 +1666,9 @@ else:
 epochs = 500
 clip_value = 1.0
 patience = 50
+rollout_eval_interval = 5
+rollout_subset_size = 6
+generation_temperature = 1.0
 #best_loss = np.inf
 
 node_lr = optimizer_node.param_groups[0]['lr']
@@ -1537,6 +1733,32 @@ for epoch in tqdm(range(start_epoch, epochs)):
     if epoch % 3 == 0 or epoch == epochs - 1:
         print(write_string)
 
+    if epoch % rollout_eval_interval == 0:
+        rollout_metrics, rollout_score = evaluate_rollout_subset(
+            node_rnn=node_rnn,
+            edge_rnn=edge_rnn,
+            hidden_projection=hidden_projection,
+            normalization_params=normalization_params,
+            device=device,
+            subset_size=rollout_subset_size,
+            epoch=epoch,
+            temperature=generation_temperature,
+            edge_threshold=EDGE_ACCEPTANCE_THRESHOLD,
+        )
+        if rollout_score < best_rollout_score:
+            best_rollout_score = rollout_score
+            torch.save(
+                {
+                    'epoch': epoch,
+                    'node_rnn_state': node_rnn.state_dict(),
+                    'edge_rnn_state': edge_rnn.state_dict(),
+                    'rollout_metrics': rollout_metrics,
+                    'rollout_score': rollout_score,
+                },
+                best_rollout_model_path,
+            )
+            print(f"Saved best rollout checkpoint with score {best_rollout_score:.4f}.")
+
     # Save the best model
     if val_node_loss < best_loss:
         best_loss = val_node_loss
@@ -1556,6 +1778,7 @@ for epoch in tqdm(range(start_epoch, epochs)):
             'scheduler_edge_state': scheduler_edge.state_dict(),
             'scaler_state': scaler.state_dict(),
             'best_loss': best_loss,
+            'best_rollout_score': best_rollout_score,
             'patience_counter': patience_counter,
             'train_losses': train_losses,
             'val_losses': val_losses
