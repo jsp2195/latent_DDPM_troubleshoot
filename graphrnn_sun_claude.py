@@ -151,11 +151,7 @@ def _select_generated_neighbors(
     else:
         candidate_neighbors = radius_neighbors
 
-    selected = []
-    for idx in candidate_neighbors:
-        if idx < len(generated_norm_edge_weights):
-            selected.append((idx, float(generated_norm_edge_weights[idx])))
-    return selected
+    return [idx for idx in candidate_neighbors if idx < len(generated_norm_edge_weights)]
 
 
 def generate_new_node(graph, node_rnn, edge_rnn, hidden_projection, M, normalization_params, device):
@@ -212,7 +208,7 @@ def generate_new_node(graph, node_rnn, edge_rnn, hidden_projection, M, normaliza
         edge_rnn_y_pred_sampled = edge_mu_pred.view(1).item()
         generated_edge_prefix.append(edge_rnn_y_pred_sampled)
 
-    selected_neighbors = _select_generated_neighbors(
+    candidate_neighbors = _select_generated_neighbors(
         new_node_features=new_node_features,
         existing_node_features=node_features,
         generated_norm_edge_weights=generated_edge_prefix,
@@ -220,7 +216,11 @@ def generate_new_node(graph, node_rnn, edge_rnn, hidden_projection, M, normaliza
         f=3.0,
         kmin=5,
     )
-    for nbr_idx, edge_w in selected_neighbors:
+    edge_threshold = 0.5
+    for nbr_idx in candidate_neighbors:
+        edge_w = float(generated_edge_prefix[nbr_idx])
+        if edge_w < edge_threshold:
+            continue
         new_edges.append((new_node_id, nbr_idx, edge_w))
         new_edges.append((nbr_idx, new_node_id, edge_w))
 
@@ -974,7 +974,8 @@ edge_rnn = CUSTOM_RNN_EDGE(
     hidden_size=hidden_size_edge_rnn,
     output_size=1,  # Ensure output_size matches the edge weights dimensions
     number_layers=num_layers,
-    dropout_rate=dropout_rate
+    dropout_rate=dropout_rate,
+    use_embedding=True
 ).to(device)
 
 hidden_projection = nn.Linear(hidden_size_node_rnn, hidden_size_edge_rnn).to(device)
@@ -1024,6 +1025,14 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
 
             x = torch.cat((positions, scales, obb_euler, curvatures), dim=-1).to(device)
             node_labels = x.clone()
+            pos_min = torch.as_tensor(normalization_params['pos_min'], dtype=torch.float32, device=device).view(1, 1, -1)
+            pos_max = torch.as_tensor(normalization_params['pos_max'], dtype=torch.float32, device=device).view(1, 1, -1)
+            scale_min = torch.as_tensor(normalization_params['scale_min'], dtype=torch.float32, device=device)
+            scale_max = torch.as_tensor(normalization_params['scale_max'], dtype=torch.float32, device=device)
+            positions_phys = denormalize_data(positions, pos_min, pos_max, from_range=(-1, 1))
+            scales_phys = denormalize_data(scales.squeeze(-1), scale_min, scale_max, from_range=(0, 1))
+            pairwise_dist = torch.cdist(positions_phys, positions_phys, p=2)
+            adaptive_radius_mask = pairwise_dist <= (3.0 * (scales_phys.unsqueeze(2) + scales_phys.unsqueeze(1)))
 
             node_rnn.hidden_n = node_rnn.init_hidden(batch_size=batch_size, device=device)
             edge_rnn.hidden_n = edge_rnn.init_hidden(batch_size=batch_size, device=device)
@@ -1073,11 +1082,13 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
                         edge_lv_high_clamp += (elv_det > 4.5).sum().item()
                         
                         edge_target = edge_weights[:, k, t].view(batch_size, 1).to(device)
-                        valid_mask = (
+                        seq_valid_mask = (
                             (k < t)
                             & (t < num_nodes_per_sample)
                             & (k < num_nodes_per_sample)
                         ).float().view(batch_size, 1)
+                        geo_valid_mask = adaptive_radius_mask[:, k, t].float().view(batch_size, 1)
+                        valid_mask = seq_valid_mask * geo_valid_mask
                         assert edge_target.shape == edge_mu.shape == edge_lv.shape, "Edge tensor shape mismatch"
 
                         # Edge Gaussian NLL (Eq. 16, D=1 so 1/2 is correct)
@@ -1171,6 +1182,14 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
 
             x = torch.cat((positions, scales, obb_euler, curvatures), dim=-1).to(device)
             node_labels = x.clone()
+            pos_min = torch.as_tensor(normalization_params['pos_min'], dtype=torch.float32, device=device).view(1, 1, -1)
+            pos_max = torch.as_tensor(normalization_params['pos_max'], dtype=torch.float32, device=device).view(1, 1, -1)
+            scale_min = torch.as_tensor(normalization_params['scale_min'], dtype=torch.float32, device=device)
+            scale_max = torch.as_tensor(normalization_params['scale_max'], dtype=torch.float32, device=device)
+            positions_phys = denormalize_data(positions, pos_min, pos_max, from_range=(-1, 1))
+            scales_phys = denormalize_data(scales.squeeze(-1), scale_min, scale_max, from_range=(0, 1))
+            pairwise_dist = torch.cdist(positions_phys, positions_phys, p=2)
+            adaptive_radius_mask = pairwise_dist <= (3.0 * (scales_phys.unsqueeze(2) + scales_phys.unsqueeze(1)))
 
             # Initialize hidden states for RNNs
             node_rnn.hidden_n = node_rnn.init_hidden(batch_size=batch_size, device=device)
@@ -1204,11 +1223,13 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
                     edge_mu = edge_mu.view(batch_size, 1)
                     edge_lv = edge_lv.view(batch_size, 1)
                     edge_target = edge_weights[:, k, t].view(batch_size, 1).to(device)
-                    valid_mask = (
+                    seq_valid_mask = (
                         (k < t)
                         & (t < num_nodes_per_sample)
                         & (k < num_nodes_per_sample)
                     ).float().view(batch_size, 1)
+                    geo_valid_mask = adaptive_radius_mask[:, k, t].float().view(batch_size, 1)
+                    valid_mask = seq_valid_mask * geo_valid_mask
                     assert edge_target.shape == edge_mu.shape == edge_lv.shape, "Edge tensor shape mismatch"
 
                     edge_var = edge_lv.exp()
