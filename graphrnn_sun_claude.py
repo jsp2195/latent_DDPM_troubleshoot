@@ -2,7 +2,7 @@ import numpy as np
 import networkx as nx
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import torch.optim as optim
 import matplotlib
 matplotlib.use('Agg')
@@ -605,6 +605,7 @@ class GraphDataset(Dataset):
         self.curvatures = curvatures
         self.edge_weights = edge_weights
         self.normalization_params = normalization_params
+        self.num_nodes_list = [int(np.asarray(p).shape[0]) for p in positions]
 
     def __len__(self):
         return len(self.adj_matrices)
@@ -621,16 +622,92 @@ class GraphDataset(Dataset):
 
 
 
+class SizeAwareBatchSampler(Sampler):
+    def __init__(self, num_nodes_list, batch_budget, shuffle=True, bucket_window=64):
+        self.num_nodes_list = list(num_nodes_list)
+        self.batch_budget = int(batch_budget)
+        self.shuffle = shuffle
+        self.bucket_window = int(bucket_window)
+        self._rng = np.random.default_rng(42)
+
+    def _ordered_indices(self):
+        indices = np.arange(len(self.num_nodes_list))
+        sort_order = np.argsort(np.asarray(self.num_nodes_list))
+        ordered = indices[sort_order].tolist()
+        if not self.shuffle:
+            return ordered
+
+        windows = [ordered[i:i + self.bucket_window] for i in range(0, len(ordered), self.bucket_window)]
+        self._rng.shuffle(windows)
+        randomized = []
+        for window in windows:
+            self._rng.shuffle(window)
+            randomized.extend(window)
+        return randomized
+
+    def _build_batches(self):
+        ordered = self._ordered_indices()
+        batches = []
+        current_batch = []
+        current_local_max = 0
+
+        for idx in ordered:
+            n_nodes = max(int(self.num_nodes_list[idx]), 1)
+            proposed_local_max = max(current_local_max, n_nodes)
+            proposed_batch_size = len(current_batch) + 1
+            proposed_cost = (proposed_local_max ** 2) * proposed_batch_size
+
+            if current_batch and proposed_cost > self.batch_budget:
+                batches.append(current_batch)
+                current_batch = [idx]
+                current_local_max = n_nodes
+            else:
+                current_batch.append(idx)
+                current_local_max = proposed_local_max
+
+        if current_batch:
+            batches.append(current_batch)
+        return batches
+
+    def __iter__(self):
+        for batch in self._build_batches():
+            yield batch
+
+    def __len__(self):
+        return len(self._build_batches())
+
+
 def custom_collate_fn(batch):
     _, edge_weights, positions, scales, obb_euler, curvatures, normalization_params, num_nodes = zip(*batch)
+    num_nodes_per_sample = torch.stack(num_nodes, dim=0)
+    batch_size = len(batch)
+    n_max = int(num_nodes_per_sample.max().item())
+
+    positions_pad = torch.zeros((batch_size, n_max, 3), dtype=torch.float32)
+    scales_pad = torch.zeros((batch_size, n_max), dtype=torch.float32)
+    obb_pad = torch.zeros((batch_size, n_max, 9), dtype=torch.float32)
+    curvatures_pad = torch.zeros((batch_size, n_max), dtype=torch.float32)
+    edge_weights_pad = torch.zeros((batch_size, n_max, n_max), dtype=torch.float32)
+    node_valid_mask = torch.zeros((batch_size, n_max), dtype=torch.bool)
+
+    for b in range(batch_size):
+        n = int(num_nodes_per_sample[b].item())
+        positions_pad[b, :n] = positions[b]
+        scales_pad[b, :n] = scales[b]
+        obb_pad[b, :n] = obb_euler[b]
+        curvatures_pad[b, :n] = curvatures[b]
+        edge_weights_pad[b, :n, :n] = edge_weights[b]
+        node_valid_mask[b, :n] = True
+
     return (
-        torch.stack(edge_weights, dim=0),
-        torch.stack(positions, dim=0),
-        torch.stack(scales, dim=0),
-        torch.stack(obb_euler, dim=0),
-        torch.stack(curvatures, dim=0),
+        edge_weights_pad,
+        positions_pad,
+        scales_pad,
+        obb_pad,
+        curvatures_pad,
         normalization_params[0],
-        torch.stack(num_nodes, dim=0),
+        num_nodes_per_sample,
+        node_valid_mask,
     )
 
 
@@ -649,6 +726,8 @@ print(f"Full val samples: {len(adj_matrices_val)}")
 subsample = True
 MAX_TRAIN_SAMPLES = 2000
 MAX_VAL_SAMPLES = 500
+SIZE_AWARE_BATCH_BUDGET = 60000
+NUM_WORKERS = 4
 
 # Slice BEFORE normalization / dataset construction
 if subsample:
@@ -687,8 +766,18 @@ TRAINING_FIRST_NODE_POOL = [
 train_graph_db = GraphDataset(
     adj_matrices, train_positions, train_scales, train_obb_euler, train_curvatures, train_edge_weights, normalization_params
 )
+train_batch_sampler = SizeAwareBatchSampler(
+    train_graph_db.num_nodes_list,
+    batch_budget=SIZE_AWARE_BATCH_BUDGET,
+    shuffle=True,
+)
 train_loader = DataLoader(
-    train_graph_db, batch_size=1, shuffle=True, collate_fn=custom_collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
+    train_graph_db,
+    batch_sampler=train_batch_sampler,
+    collate_fn=custom_collate_fn,
+    num_workers=NUM_WORKERS,
+    pin_memory=True,
+    persistent_workers=NUM_WORKERS > 0,
 )
 
 val_positions, val_scales, val_obb_euler, val_curvatures, val_edge_weights, normalization_params_val = normalize_dataset(
@@ -698,8 +787,18 @@ val_positions, val_scales, val_obb_euler, val_curvatures, val_edge_weights, norm
 val_graph_db = GraphDataset(
     adj_matrices_val, val_positions, val_scales, val_obb_euler, val_curvatures, val_edge_weights, normalization_params_val
 )
+val_batch_sampler = SizeAwareBatchSampler(
+    val_graph_db.num_nodes_list,
+    batch_budget=SIZE_AWARE_BATCH_BUDGET,
+    shuffle=False,
+)
 val_loader = DataLoader(
-    val_graph_db, batch_size=1, shuffle=False, collate_fn=custom_collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
+    val_graph_db,
+    batch_sampler=val_batch_sampler,
+    collate_fn=custom_collate_fn,
+    num_workers=NUM_WORKERS,
+    pin_memory=True,
+    persistent_workers=NUM_WORKERS > 0,
 )
 
 def create_graph_from_adj_matrix(adj_matrix, positions, scales, obb_euler, curvatures, edge_weights):
@@ -815,8 +914,22 @@ class CUSTOM_RNN_NODE(nn.Module):
         # Concatenate raw features with embeddings
         input_concat = torch.cat((input, input_embed), dim=2)  # (batch_size, seq_length, input_size + embedding_size)
 
-        # GRU forward pass
-        h, h_n = self.rnn(input_concat)
+        # GRU forward pass (optionally packed for variable-length batches)
+        if seq_lengths is not None and is_packed:
+            packed_input = pack_padded_sequence(
+                input_concat,
+                lengths=seq_lengths.detach().cpu(),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            packed_h, h_n = self.rnn(packed_input)
+            h, _ = pad_packed_sequence(
+                packed_h,
+                batch_first=True,
+                total_length=input_concat.size(1),
+            )
+        else:
+            h, h_n = self.rnn(input_concat)
         self.hidden_n = h_n
 
         seq_len = h.size(1)
@@ -1025,9 +1138,10 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
 
     for i, data in enumerate(train_loader):
         try:
-            edge_weights, positions, scales, obb_euler, curvatures, normalization_params, num_nodes_per_sample = data
+            edge_weights, positions, scales, obb_euler, curvatures, normalization_params, num_nodes_per_sample, node_valid_mask = data
             batch_size = positions.size(0)
             num_nodes_per_sample = num_nodes_per_sample.to(device, non_blocking=True)
+            node_valid_mask = node_valid_mask.to(device, non_blocking=True)
             num_nodes = int(num_nodes_per_sample.max().item())
             max_seq_len = max(num_nodes - 1, 1)  # Ensure max_seq_len is at least 1
 
@@ -1047,6 +1161,8 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
             scales_phys = denormalize_data(scales.squeeze(-1), scale_min, scale_max, from_range=(0, 1))
             pairwise_dist = torch.cdist(positions_phys, positions_phys, p=2)
             adaptive_radius_mask = pairwise_dist <= (3.0 * (scales_phys.unsqueeze(2) + scales_phys.unsqueeze(1)))
+            pair_valid_mask = node_valid_mask.unsqueeze(2) & node_valid_mask.unsqueeze(1)
+            adaptive_radius_mask = adaptive_radius_mask & pair_valid_mask
 
             node_rnn.hidden_n = node_rnn.init_hidden(batch_size=batch_size, device=device)
             edge_rnn.hidden_n = edge_rnn.init_hidden(batch_size=batch_size, device=device)
@@ -1057,7 +1173,7 @@ def train_epoch(node_rnn, edge_rnn, train_loader, optimizer_node, optimizer_edge
 
             with autocast("cuda"):
                 node_mu, node_lv = node_rnn(
-                    x, node_labels, seq_lengths=num_nodes_per_sample, is_packed=False
+                    x, node_labels, seq_lengths=num_nodes_per_sample
                 )
 
                 if max_seq_len > 0:
@@ -1189,9 +1305,10 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
 
     with torch.no_grad():  # Disable gradient computation during validation
         for data in val_loader:
-            edge_weights, positions, scales, obb_euler, curvatures, normalization_params, num_nodes_per_sample = data
+            edge_weights, positions, scales, obb_euler, curvatures, normalization_params, num_nodes_per_sample, node_valid_mask = data
             batch_size = positions.size(0)
             num_nodes_per_sample = num_nodes_per_sample.to(device, non_blocking=True)
+            node_valid_mask = node_valid_mask.to(device, non_blocking=True)
             num_nodes = int(num_nodes_per_sample.max().item())
             max_seq_len = max(num_nodes - 1, 1)  # Ensure max_seq_len is at least 1
 
@@ -1212,6 +1329,8 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
             scales_phys = denormalize_data(scales.squeeze(-1), scale_min, scale_max, from_range=(0, 1))
             pairwise_dist = torch.cdist(positions_phys, positions_phys, p=2)
             adaptive_radius_mask = pairwise_dist <= (3.0 * (scales_phys.unsqueeze(2) + scales_phys.unsqueeze(1)))
+            pair_valid_mask = node_valid_mask.unsqueeze(2) & node_valid_mask.unsqueeze(1)
+            adaptive_radius_mask = adaptive_radius_mask & pair_valid_mask
 
             # Initialize hidden states for RNNs
             node_rnn.hidden_n = node_rnn.init_hidden(batch_size=batch_size, device=device)
@@ -1222,7 +1341,7 @@ def validate_epoch(node_rnn, edge_rnn, val_loader, device, weight_penalty=weight
             edge_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
 
             node_mu, node_lv = node_rnn(
-                x, node_labels, seq_lengths=num_nodes_per_sample, is_packed=False
+                x, node_labels, seq_lengths=num_nodes_per_sample
             )
 
             if max_seq_len > 0:
@@ -1313,7 +1432,7 @@ def clear_memory():
 state_checkpoint_path = os.path.join(output_folder, "training_state.pth")
 
 optimizer_node = optim.AdamW(
-    list(node_rnn.parameters()) + list(hidden_projection.parameters()),
+    list(node_rnn.parameters()),
     lr=lr,
     weight_decay=1e-5
 )
